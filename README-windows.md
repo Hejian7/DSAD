@@ -1,4 +1,4 @@
-﻿# DSH-QQ 一键部署（Windows）
+# DSH-QQ 一键部署（Windows）
 
 全脚本部署 **AstrBot + NapCat** 并接到 QQ。不开 GUI，不点按钮：
 
@@ -154,3 +154,22 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy.ps1
 - `astrbot-install-<时间>.log`：官方安装脚本的输出
 - `astrbot.out.log` / `astrbot.err.log`：AstrBot 运行输出
 - `astrbot-init.log`：astrbot init 的输出
+---
+
+## 群聊预设（`-Group`）
+
+卖群机器人时用这个，一次把该配的都配好：
+
+```powershell
+.\deploy.ps1 -QQ 123456789 -ApiKey sk-xxx -Group -WakeWord 小五 -GroupId 946970466 -InstallWatchdog
+```
+
+它会写：
+
+- `wake_prefix` = 唤醒词（群里必须叫它才理）
+- `platform_settings.enable_id_white_list` = true，并把群号加进白名单
+- `rate_limit` = 60 秒 12 条，策略 `stall`（超了排队不回，不刷屏）
+- `ignore_bot_self_message` = true（防自问自答）
+- **Agent 执行权限保持关闭**：群里谁都不该让机器人跑命令
+
+`-GroupId` 可以先不给，装完在群里发 `/sid` 拿到群号再补。

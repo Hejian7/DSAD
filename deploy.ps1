@@ -37,6 +37,9 @@ param(
     [string]$DownloadSource = 'china',
     [switch]$SelfCheck,
     [switch]$Probe,
+    [switch]$Group,
+    [string]$WakeWord = '小五',
+    [string]$GroupId = '',
     [switch]$KeepNapCatRunning,
     [switch]$InstallWatchdog,
     [switch]$Uninstall,
@@ -290,7 +293,7 @@ function Start-AstrBot($Target) {
 }
 
 # ── 写 AstrBot 配置 ────────────────────────────────────────────────────────
-function Set-AstrBotConfig($Target, [string]$QQNumber, [string]$Key) {
+function Set-AstrBotConfig($Target, [string]$QQNumber, [string]$Key, [switch]$GroupMode, [string]$Wake = "小五", [string]$Gid = "") {
     Step 4 '对齐 AstrBot 的 OneBot 服务端信息'
 
     if (-not (Test-Path $Target.Config)) {
@@ -359,6 +362,27 @@ function Set-AstrBotConfig($Target, [string]$QQNumber, [string]$Key) {
     if (-not $cfg.admins_id) { $cfg | Add-Member -NotePropertyName admins_id -NotePropertyValue @() -Force }
     $admins = @(@($cfg.admins_id) | Where-Object { $_ -match '^\d{5,12}$' -or $_ -eq 'astrbot' })
     if ($admins -notcontains $QQNumber) { $admins += $QQNumber; $cfg.admins_id = $admins; $changed = $true; Ok ('管理员已加入 ' + $QQNumber) }
+
+    if ($GroupMode) {
+        if (-not $cfg.platform_settings) { $cfg | Add-Member -NotePropertyName platform_settings -NotePropertyValue ([pscustomobject]@{}) -Force }
+        $ps = $cfg.platform_settings
+        $ps.enable_id_white_list = $true
+        $wl = @(@($ps.id_whitelist) | Where-Object { $_ -ne $null -and "$_" -ne '' })
+        if ($Gid -ne '' -and ($wl -notcontains $Gid)) { $wl += $Gid }
+        if ($wl.Count -gt 0) { $ps.id_whitelist = $wl }
+        if (-not $ps.rate_limit) { $ps.rate_limit = [pscustomobject]@{} }
+        $ps.rate_limit.time = 60
+        $ps.rate_limit.count = 12
+        $ps.rate_limit.strategy = 'stall'
+        $ps.friend_message_needs_wake_prefix = $false
+        $ps.ignore_bot_self_message = $true
+        $cfg.wake_prefix = @($Wake)
+        $changed = $true
+        Ok ('群聊预设：唤醒词「' + $Wake + '」')
+        if ($Gid -ne '') { Ok ('群白名单：' + $Gid) } else { Info '没给群号：白名单留空，等你在群里用 /sid 拿到群号后再加' }
+        Ok '限流：每人每分钟 12 条（超出排队不回）'
+        Ok 'Agent 执行权限保持关闭（群聊不需要，也不该给）'
+    }
 
     Write-Json $Target.Config $cfg
     return [pscustomobject]@{ Port = $obPort; Token = $obToken; Changed = $changed }
@@ -843,7 +867,7 @@ try {
         Ok '配置已生成'
     }
 
-    $ob = Set-AstrBotConfig $ab $QQ $ApiKey
+    $ob = Set-AstrBotConfig $ab $QQ $ApiKey -GroupMode:$Group -Wake $WakeWord -Gid $GroupId
 
     Info '重启 AstrBot 让配置生效'
     if (Stop-AstrBot) { Start-Sleep -Seconds 3 }

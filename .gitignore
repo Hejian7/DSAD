@@ -1,0 +1,16 @@
+# 运行产物
+logs/
+*.log
+data/
+*.bak-*
+
+# 本地配置与密钥
+.env
+*.secret
+onebot-token.txt
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

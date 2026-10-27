@@ -33,6 +33,9 @@ INSTALL_DEPS=1
 DO_PROBE=0
 DO_SELF_CHECK=0
 DO_UNINSTALL=0
+GROUP_MODE=0
+WAKE_WORD="小五"
+GROUP_ID=""
 
 # ── 输出 ────────────────────────────────────────────────────────────────────
 c_reset=$'\033[0m'; c_cyan=$'\033[36m'; c_green=$'\033[32m'
@@ -79,6 +82,9 @@ usage() {
   --workdir <目录>       AstrBot 工作目录，默认 /opt/dsh-qq-deploy/astrbot
   --source <china|official>  下载源，默认 china
   --no-deps              跳过 apt 依赖安装
+  --group                群聊预设：唤醒词 + 群白名单 + 限流，Agent 权限保持关闭
+  --wake <词>            唤醒词，默认 小五
+  --group-id <群号>      群白名单（可选，之后也能在面板里加）
   --probe                只探测，不写任何配置
   --self-check           只体检
   --uninstall            回滚 AstrBot 配置 + 停服务
@@ -96,6 +102,9 @@ while [ $# -gt 0 ]; do
     --workdir) WORK_DIR="${2:-}"; shift 2 ;;
     --source) DOWNLOAD_SOURCE="${2:-}"; shift 2 ;;
     --no-deps) INSTALL_DEPS=0; shift ;;
+    --group) GROUP_MODE=1; shift ;;
+    --wake) WAKE_WORD="${2:-小五}"; shift 2 ;;
+    --group-id) GROUP_ID="${2:-}"; shift 2 ;;
     --probe) DO_PROBE=1; shift ;;
     --self-check) DO_SELF_CHECK=1; shift ;;
     --uninstall) DO_UNINSTALL=1; shift ;;
@@ -281,6 +290,27 @@ write_astrbot_config() {
       .admins_id = (((.admins_id // []) | map(select(type=="string" and (test("^[0-9]{5,12}$") or .=="astrbot")))) + [$qq] | unique)
     ' "$cfg" > "$tmpc" && mv "$tmpc" "$cfg"
     ok "管理员已加入 $QQ"
+  fi
+
+  if [ "$GROUP_MODE" -eq 1 ]; then
+    tmpc="$(mktemp)"
+    jq --arg wake "$WAKE_WORD" --arg gid "$GROUP_ID" '
+      .platform_settings = (.platform_settings // {}) |
+      .platform_settings.enable_id_white_list = true |
+      .platform_settings.id_whitelist = (((.platform_settings.id_whitelist // []) | map(tostring)) + (if $gid != "" then [$gid] else [] end) | unique) |
+      .platform_settings.rate_limit = ((.platform_settings.rate_limit // {}) + {time:60, count:12, strategy:"stall"}) |
+      .platform_settings.friend_message_needs_wake_prefix = false |
+      .platform_settings.ignore_bot_self_message = true |
+      .wake_prefix = [$wake] |
+      .provider_settings = (.provider_settings // {}) |
+      .provider_settings.computer_use_require_admin = true |
+      .provider_settings.computer_use_local_permissions = (.provider_settings.computer_use_local_permissions // {}) |
+      .provider_settings.computer_use_local_permissions.member = ((.provider_settings.computer_use_local_permissions.member // {}) + {allow_execution:false, allow_network:false, filesystem_scope:"workspace"})
+    ' "$cfg" > "$tmpc" && mv "$tmpc" "$cfg"
+    ok "群聊预设：唤醒词「${WAKE_WORD}」"
+    if [ -n "$GROUP_ID" ]; then ok "群白名单：${GROUP_ID}"; else info "没给群号：白名单留空，之后在群里用 /sid 拿到群号再加"; fi
+    ok "限流：每人每分钟 12 条"
+    ok "Agent 执行权限保持关闭"
   fi
 
   local u; u="$(as_user)"; chown "$u":"$u" "$cfg" 2>/dev/null || true

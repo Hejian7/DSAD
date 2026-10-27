@@ -119,3 +119,13 @@ Docker 模式适合：系统仓库里没有 Xvfb、或不想让 QQ 跑在宿主�
   2. NapCat 在 Linux 里配置目录的确切位置（脚本用 `find` 猜，猜不到会落到 `~/Napcat/config`）；
   3. Docker 模式下 `host.docker.internal` 的连通性（已加 `host-gateway`，但仍需实测）。
 - 建议第一次先在一台测试机（或 WSL）上跑 `--probe` 和 `--self-check`，再上正式服务器。
+---
+
+## 群聊预设（`--group`）
+
+```bash
+sudo bash deploy.sh --qq 123456789 --api-key sk-xxx --group --wake 小五 --group-id 946970466
+```
+
+写的东西和 Windows 版一致：唤醒词、群白名单、每人每分钟 12 条限流、忽略自己的消息、**Agent 权限保持关闭**。
+群号可以之后用 `/sid` 拿到再补。
