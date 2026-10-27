@@ -158,10 +158,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy.ps1
 
 ## 群聊预设（`-Group`）
 
-卖群机器人时用这个，一次把该配的都配好：
+群机器人时用这个，一次把该配的都配好：
 
 ```powershell
-.\deploy.ps1 -QQ 123456789 -ApiKey sk-xxx -Group -WakeWord 小五 -GroupId 946970466 -InstallWatchdog
+.\deploy.ps1 -QQ 123456789 -ApiKey sk-xxx -Group -WakeWord 鱼 -GroupId 987654123 -InstallWatchdog
 ```
 
 它会写：
