@@ -1,0 +1,883 @@
+﻿<#
+.SYNOPSIS
+    DSH / 大肥鱼 QQ 机器人一键部署（Windows）
+.DESCRIPTION
+    全程脚本，不开 GUI：
+      1) 检查环境
+      2) 没装 AstrBot 就跑官方脚本部署（uv tool install，中国大陆镜像）
+      3) 建工作目录、astrbot init、写 OneBot 平台（端口 + token）、模型、管理员
+      4) astrbot run 起服务，等 6199 端口
+      5) 定位 NapCat，把它那条反向 WS 客户端指向这台 AstrBot
+      6) 重启 NapCat、等扫码、等两端握手
+      7) 自检 + 可选守护任务
+.NOTES
+    AstrBot 的两种形态都认：
+      · CLI 安装（uv tool install astrbot）—— 工作目录里 data\cmd_config.json
+      · 启动器安装 —— 实例目录里 core\data\cmd_config.json
+    重复运行安全：已有端口/token 一律沿用。
+.EXAMPLE
+    .\deploy.ps1 -QQ 123456789 -ApiKey sk-xxx
+.EXAMPLE
+    .\deploy.ps1 -Probe
+#>
+[CmdletBinding()]
+param(
+    [string]$ApiKey,
+    [string]$QQ,
+    [string]$Model = 'deepseek-flash',
+    [ValidateSet('auto', 'cli', 'launcher')]
+    [string]$Mode = 'auto',
+    [string]$AstrBotDir,
+    [string]$WorkDir,
+    [string]$NapCatDir,
+    [int]$OneBotPort = 6199,
+    [ValidateSet('auto', 'onekey', 'shell')]
+    [string]$NapCatMode = 'auto',
+    [ValidateSet('china', 'official')]
+    [string]$DownloadSource = 'china',
+    [switch]$SelfCheck,
+    [switch]$Probe,
+    [switch]$KeepNapCatRunning,
+    [switch]$InstallWatchdog,
+    [switch]$Uninstall,
+    [switch]$Quiet
+)
+
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+
+# ── 常量 ───────────────────────────────────────────────────────────────────
+$script:AppName = 'DSH-QQ 一键部署'
+$script:Root = Join-Path $env:LOCALAPPDATA 'dsh-qq-deploy'
+$script:LogDir = Join-Path $script:Root 'logs'
+$script:LogFile = Join-Path $script:LogDir ('deploy-{0}.log' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+$script:InstallUrl = 'https://docs.astrbot.app/install.ps1'
+
+# ── 输出 ───────────────────────────────────────────────────────────────────
+function Write-Log([string]$Text) {
+    if (-not (Test-Path $script:LogDir)) { New-Item -ItemType Directory -Path $script:LogDir -Force | Out-Null }
+    $line = '[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Text
+    Add-Content -Path $script:LogFile -Value $line -Encoding UTF8
+}
+function Say([string]$Text, [string]$Color = 'Gray') {
+    if (-not $Quiet) { Write-Host $Text -ForegroundColor $Color }
+    Write-Log $Text
+}
+function Step([string]$No, [string]$Title) {
+    Say ''
+    Say ("[{0}] {1}" -f $No, $Title) 'Cyan'
+}
+function Ok([string]$Text)   { Say ("    √ " + $Text) 'Green' }
+function Info([string]$Text) { Say ("    · " + $Text) 'Gray' }
+function Warn([string]$Text) { Say ("    ! " + $Text) 'Yellow' }
+
+function Fail([string]$Reason, [string]$Hint = '') {
+    Say ''
+    Say '──────────────────────────────────────────────' 'Red'
+    Say ("✗ 失败：" + $Reason) 'Red'
+    if ($Hint -ne '') {
+        Say ''
+        Say '怎么办：' 'Yellow'
+        foreach ($l in ($Hint -split "`n")) { Say ('  ' + $l) 'Yellow' }
+    }
+    Say ''
+    Say ('完整日志：' + $script:LogFile) 'DarkGray'
+    Say '──────────────────────────────────────────────' 'Red'
+    Write-Log ("FAIL: " + $Reason)
+    exit 1
+}
+
+function Test-IsAdmin {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+# ── 基础工具 ───────────────────────────────────────────────────────────────
+function Backup-File([string]$Path) {
+    if (Test-Path $Path) {
+        $bak = '{0}.bak-{1}' -f $Path, (Get-Date -Format 'yyyyMMdd-HHmmss')
+        Copy-Item $Path $bak -Force
+        Info ('已备份原配置：' + (Split-Path $bak -Leaf))
+    }
+}
+
+function Read-Json([string]$Path) {
+    $raw = Get-Content -Path $Path -Raw -Encoding UTF8
+    $raw = $raw -replace '^\uFEFF', ''
+    try { return ($raw | ConvertFrom-Json) }
+    catch { Fail ('配置文件不是合法 JSON：' + $Path) ("这个文件可能被手动改坏了。先还原成同目录的 .bak-时间戳 备份，再重跑。`n出错位置：" + $_.Exception.Message) }
+}
+
+function Write-Json([string]$Path, $Object) {
+    $dir = Split-Path $Path -Parent
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $json = $Object | ConvertTo-Json -Depth 40
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    [IO.File]::WriteAllText($Path, $json + "`n", $utf8)
+}
+
+function Test-PortListen([int]$Port) {
+    return [bool](Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
+}
+
+function Wait-Until([scriptblock]$Condition, [int]$TimeoutSec, [string]$ProgressText = '') {
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        if (& $Condition) {
+            if ($ProgressText -ne '' -and -not $Quiet) { Write-Host '' }
+            return $true
+        }
+        if ($ProgressText -ne '' -and -not $Quiet) {
+            Write-Host ("`r    等待 " + $ProgressText + " ... 还剩 " + [int]($deadline - (Get-Date)).TotalSeconds + " 秒") -NoNewline -ForegroundColor DarkGray
+        }
+        Start-Sleep -Milliseconds 1000
+    }
+    if ($ProgressText -ne '' -and -not $Quiet) { Write-Host '' }
+    return $false
+}
+
+# ── AstrBot：识别 / 安装 / 配置 / 启动 ─────────────────────────────────────
+function Get-LauncherInstances {
+    $instances = Join-Path $env:USERPROFILE '.astrbot_launcher\instances'
+    if (-not (Test-Path $instances)) { return @() }
+    return @(Get-ChildItem $instances -Directory -ErrorAction SilentlyContinue |
+        Where-Object { Test-Path (Join-Path $_.FullName 'core\main.py') } |
+        Sort-Object LastWriteTime -Descending)
+}
+
+function Get-AstrBotCli {
+    $cmd = Get-Command 'astrbot' -ErrorAction SilentlyContinue
+    if ($cmd -and $cmd.Source) { return $cmd.Source }
+
+    $cands = @(
+        (Join-Path $env:USERPROFILE '.local\bin\astrbot.exe'),
+        (Join-Path $env:USERPROFILE '.local\bin\astrbot'),
+        (Join-Path $env:APPDATA 'uv\tools\astrbot\Scripts\astrbot.exe'),
+        (Join-Path $env:APPDATA 'uv\tools\astrbot\bin\astrbot.exe')
+    )
+    foreach ($c in $cands) { if (Test-Path $c) { return $c } }
+    return $null
+}
+
+function Install-AstrBot {
+    Step '2.1' ('官方脚本部署 AstrBot（下载源：' + $DownloadSource + '）')
+
+    $ps1 = Join-Path $script:Root 'install.astrbot.ps1'
+    if (-not (Test-Path $script:Root)) { New-Item -ItemType Directory -Path $script:Root -Force | Out-Null }
+    try {
+        Info ('下载安装脚本：' + $script:InstallUrl)
+        Invoke-WebRequest -Uri $script:InstallUrl -OutFile $ps1 -UseBasicParsing -TimeoutSec 60
+    } catch {
+        Fail '下载 AstrBot 安装脚本失败' ("访问不了 docs.astrbot.app。`n1) 检查网络/代理；2) 手动打开 " + $script:InstallUrl + " 让客户跑一遍，再回来重跑本脚本（会自动认出已装好的 astrbot）。`n详细：" + $_.Exception.Message)
+    }
+
+    Info '开始安装：uv + Python 3.12 + astrbot（第一次要几分钟，别关窗口）'
+    $log = Join-Path $script:LogDir ('astrbot-install-{0}.log' -f (Get-Date -Format 'HHmmss'))
+    $proc = Start-Process -FilePath 'powershell.exe' `
+        -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $ps1, '-Language', 'zh-CN', '-DownloadSource', $DownloadSource, '-NonInteractive') `
+        -RedirectStandardOutput $log -RedirectStandardError ($log + '.err') -PassThru -NoNewWindow
+
+    if (-not $proc.WaitForExit(900000)) {
+        try { $proc.Kill() } catch {}
+        Fail 'AstrBot 安装超过 15 分钟没结束' ("可能卡在下载（网络）。看日志里最后几行：`n" + $log + "`n也可以手动在 PowerShell 里跑一遍安装脚本，成功后再执行本脚本。")
+    }
+    if ($proc.ExitCode -ne 0) {
+        $tail = ''
+        if (Test-Path $log) { $tail = (Get-Content $log -Tail 12 | Out-String) }
+        Fail ('AstrBot 安装脚本返回了错误码 ' + $proc.ExitCode) ("常见原因：下载源不通、代理没开、或已有 uv 冲突。`n1) 换源重试：-DownloadSource official`n2) 看日志末尾：`n" + $tail)
+    }
+    Ok '官方安装脚本执行完成'
+}
+
+function Resolve-AstrBot {
+    Step 2 '定位 AstrBot'
+
+    if ($Mode -eq 'launcher') {
+        if ($AstrBotDir) { $inst = $AstrBotDir }
+        else { $found = @(Get-LauncherInstances); if ($found.Count -gt 0) { $inst = $found[0].FullName } }
+        if (-not $inst -or -not (Test-Path (Join-Path $inst 'core\main.py'))) {
+            Fail '没找到启动器安装的 AstrBot' '用 -AstrBotDir 指向实例目录，或者把 -Mode 改成 auto / cli 让脚本走官方脚本部署。'
+        }
+        Ok ('使用启动器实例：' + $inst)
+        return [pscustomobject]@{ Kind = 'launcher'; Root = $inst; Config = (Join-Path $inst 'core\data\cmd_config.json') }
+    }
+
+    if ($Mode -eq 'auto') {
+        $found = @(Get-LauncherInstances)
+        if ($found.Count -gt 0) {
+            Ok ('发现启动器实例（-Mode auto 优先用它）：' + $found[0].Name)
+            Info '想改走 CLI 部署：加 -Mode cli'
+            return [pscustomobject]@{ Kind = 'launcher'; Root = $found[0].FullName; Config = (Join-Path $found[0].FullName 'core\data\cmd_config.json') }
+        }
+    }
+
+    if (-not $AstrBotDir -and -not (Get-AstrBotCli)) {
+        Warn '没找到 astrbot 命令，先装'
+        Install-AstrBot
+    }
+
+    $cli = Get-AstrBotCli
+    if (-not $cli) {
+        Fail '装完了还是找不到 astrbot 命令' @"
+通常是 PATH 没刷新。按顺序试：
+
+  1) 关掉这个窗口，重新开一个 PowerShell 再跑（PATH 是登录时读的）
+  2) 或者手动执行：where.exe astrbot
+  3) 还不行就看日志：%LOCALAPPDATA%\dsh-qq-deploy\logs\astrbot-install-*.log
+"@
+    }
+    Ok ('astrbot：' + $cli)
+
+    $work = $WorkDir
+    if (-not $work) { $work = Join-Path $script:Root 'astrbot' }
+    if (-not (Test-Path $work)) { New-Item -ItemType Directory -Path $work -Force | Out-Null }
+    Ok ('工作目录：' + $work)
+    return [pscustomobject]@{ Kind = 'cli'; Root = $work; Config = (Join-Path $work 'data\cmd_config.json'); Cli = $cli }
+}
+
+function Initialize-AstrBotWorkdir($Target) {
+    if ($Target.Kind -ne 'cli') { return }
+    Step '2.2' '初始化 AstrBot 工作目录（astrbot init）'
+
+    if (Test-Path $Target.Config) { Ok '已有配置，跳过 init'; return }
+
+    $cli = $Target.Cli
+    $empty = Join-Path $script:Root 'empty.stdin'
+    Set-Content -Path $empty -Value '' -Encoding ASCII
+    $out = Join-Path $script:LogDir 'astrbot-init.log'
+    try {
+        $p = Start-Process -FilePath $cli -ArgumentList @('init') -WorkingDirectory $Target.Root `
+            -RedirectStandardInput $empty -RedirectStandardOutput $out -RedirectStandardError ($out + '.err') -PassThru -NoNewWindow
+        $null = $p.WaitForExit(180000)
+    } catch {
+        Warn ('astrbot init 没跑起来：' + $_.Exception.Message)
+    }
+
+    if (Test-Path $Target.Config) { Ok '工作目录初始化完成'; return }
+    Warn 'init 之后还没看到配置文件：先启动一次 AstrBot，它会自己生成'
+}
+
+function Get-AstrBotProcess {
+    $list = @()
+    $list += @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -match 'core\\main\.py' })
+    $list += @(Get-CimInstance Win32_Process -Filter "Name='astrbot.exe'" -ErrorAction SilentlyContinue)
+    return $list
+}
+
+function Stop-AstrBot {
+    $procs = Get-AstrBotProcess
+    foreach ($p in $procs) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
+    return ($procs.Count -gt 0)
+}
+
+function Start-AstrBot($Target) {
+    $logOut = Join-Path $script:LogDir 'astrbot.out.log'
+    $logErr = Join-Path $script:LogDir 'astrbot.err.log'
+
+    if ($Target.Kind -eq 'cli') {
+        Info '启动 astrbot run（后台，日志 logs\astrbot.out.log）'
+        Start-Process -FilePath $Target.Cli -ArgumentList @('run') -WorkingDirectory $Target.Root `
+            -RedirectStandardOutput $logOut -RedirectStandardError $logErr -WindowStyle Hidden
+        return
+    }
+
+    $py = Join-Path $Target.Root 'venv\Scripts\python.exe'
+    if (-not (Test-Path $py)) { Fail ('这个实例里没有 Python 环境：' + $Target.Root) '启动器装的实例缺运行环境，用启动器重装，或改用 -Mode cli。' }
+    Info '启动 AstrBot（后台，日志 logs\astrbot.out.log）'
+    Start-Process -FilePath $py -ArgumentList ('"' + (Join-Path $Target.Root 'core\main.py') + '"') -WorkingDirectory (Join-Path $Target.Root 'core') `
+        -RedirectStandardOutput $logOut -RedirectStandardError $logErr -WindowStyle Hidden
+}
+
+# ── 写 AstrBot 配置 ────────────────────────────────────────────────────────
+function Set-AstrBotConfig($Target, [string]$QQNumber, [string]$Key) {
+    Step 4 '对齐 AstrBot 的 OneBot 服务端信息'
+
+    if (-not (Test-Path $Target.Config)) {
+        Fail ('找不到 AstrBot 配置：' + $Target.Config) '先把 AstrBot 启动一次，让它生成 data\cmd_config.json，再重跑本脚本。'
+    }
+    Backup-File $Target.Config
+    $cfg = Read-Json $Target.Config
+    $changed = $false
+
+    if (-not $cfg.platform) { $cfg | Add-Member -NotePropertyName platform -NotePropertyValue @() -Force }
+    $platforms = @($cfg.platform)
+    $plat = $platforms | Where-Object { $_.type -eq 'aiocqhttp' } | Select-Object -First 1
+
+    if (-not $plat) {
+        $plat = [pscustomobject]@{
+            id = 'deploy'; type = 'aiocqhttp'; enable = $true
+            ws_reverse_host = '0.0.0.0'; ws_reverse_port = $OneBotPort
+            ws_reverse_token = (-join ((48..57) + (65..90) + (97..122) | Get-Random -Count 32 | ForEach-Object { [char]$_ }))
+        }
+        $platforms += $plat
+        $changed = $true
+        Ok ('没有 OneBot 平台，已新建：端口 ' + $OneBotPort)
+    } else {
+        if ($plat.enable -ne $true) { $plat.enable = $true; $changed = $true }
+        if (-not $plat.ws_reverse_port) { $plat.ws_reverse_port = $OneBotPort; $changed = $true }
+        if (-not $plat.ws_reverse_token) {
+            $plat.ws_reverse_token = (-join ((48..57) + (65..90) + (97..122) | Get-Random -Count 32 | ForEach-Object { [char]$_ }))
+            $changed = $true
+        }
+    }
+    $cfg.platform = $platforms
+
+    $obPort = [int]$plat.ws_reverse_port
+    $obToken = [string]$plat.ws_reverse_token
+    Ok ('服务端信息：端口 ' + $obPort + '，token ' + $obToken.Substring(0, [Math]::Min(6, $obToken.Length)) + '…（前六位）')
+
+    if ($Key -ne '') {
+        if (-not $cfg.provider_sources) { $cfg | Add-Member -NotePropertyName provider_sources -NotePropertyValue @() -Force }
+        $src = @($cfg.provider_sources) | Where-Object { $_.provider -eq 'deepseek' } | Select-Object -First 1
+        if (-not $src) {
+            $src = [pscustomobject]@{
+                provider = 'deepseek'; type = 'openai_chat_completion'; provider_type = 'chat_completion'
+                key = @($Key); api_base = 'https://api.deepseek.com/v1'; timeout = 120; proxy = ''
+                custom_headers = @{}; id = 'deepseek'; enable = $true
+            }
+            $cfg.provider_sources = @($cfg.provider_sources) + $src
+            $changed = $true
+        } else {
+            $src.key = @($Key); $src.enable = $true; $changed = $true
+        }
+        if (-not $cfg.provider) { $cfg | Add-Member -NotePropertyName provider -NotePropertyValue @() -Force }
+        $prov = @($cfg.provider) | Where-Object { $_.id -eq ('deepseek/' + $Model) } | Select-Object -First 1
+        if (-not $prov) {
+            $prov = [pscustomobject]@{
+                id = 'deepseek/' + $Model; enable = $true; provider_source_id = 'deepseek'; model = $Model
+                modalities = @('text', 'image', 'tool_use'); custom_extra_body = @{}; max_context_tokens = 1000000
+            }
+            $cfg.provider = @($cfg.provider) + $prov
+            $changed = $true
+        }
+        Ok ('模型 deepseek/' + $Model + ' 已配置')
+    } else {
+        Info '没给 API Key：模型不动，客户自己在 WebUI 里填'
+    }
+
+    if (-not $cfg.admins_id) { $cfg | Add-Member -NotePropertyName admins_id -NotePropertyValue @() -Force }
+    $admins = @(@($cfg.admins_id) | Where-Object { $_ -match '^\d{5,12}$' -or $_ -eq 'astrbot' })
+    if ($admins -notcontains $QQNumber) { $admins += $QQNumber; $cfg.admins_id = $admins; $changed = $true; Ok ('管理员已加入 ' + $QQNumber) }
+
+    Write-Json $Target.Config $cfg
+    return [pscustomobject]@{ Port = $obPort; Token = $obToken; Changed = $changed }
+}
+
+# ── NapCat：识别 / 配置 / 启动 ─────────────────────────────────────────────
+function Get-NapCatConfigDirs([string]$Root) {
+    # 返回候选 config 目录（可能还不存在——首次启动前 NapCat 没建，我们会自己建）
+    $found = @()
+
+    $direct = Join-Path $Root 'config'
+    if (Test-Path $direct) { $found += (Resolve-Path $direct).Path }
+
+    $versions = Join-Path $Root 'versions'
+    if (Test-Path $versions) {
+        Get-ChildItem $versions -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            $nap = Join-Path $_.FullName 'resources\app\napcat'
+            if (Test-Path $nap) { $found += (Join-Path $nap 'config') }
+        }
+    }
+
+    if ($found.Count -eq 0) {
+        Get-ChildItem $Root -Recurse -Depth 5 -Directory -Filter 'napcat' -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -notmatch 'bootmain' } |
+            ForEach-Object { $found += (Join-Path $_.FullName 'config') }
+    }
+    return @($found | Select-Object -Unique)
+}
+
+function Test-NapCatRoot([string]$Root) {
+    if (-not (Test-Path (Join-Path $Root 'NapCatWinBootMain.exe'))) { return $false }
+    if ((Split-Path $Root -Leaf) -match 'bootmain') { return $false }
+    if ((Split-Path $Root -Leaf) -match '^NapCat\.[\d.]+\.Shell$') { return $true }   # 一体包
+    return ((Get-NapCatConfigDirs $Root).Count -gt 0)
+}
+
+function Test-NapCatSelfContained([string]$Root) {
+    # 自带 QQ 的一体包：根目录里有 versions\<qq版本>-<build>\resources\app\napcat
+    $versions = Join-Path $Root 'versions'
+    if (-not (Test-Path $versions)) { return $false }
+    foreach ($d in (Get-ChildItem $versions -Directory -ErrorAction SilentlyContinue)) {
+        if (Test-Path (Join-Path $d.FullName 'resources\app\napcat')) { return $true }
+    }
+    return $false
+}
+
+function Install-NapCatOneKey {
+    Step '3.1' '安装 NapCat 一体包（自带 QQ，不用客户预装）'
+
+    $base = Join-Path $script:Root 'napcat-onekey'
+    if (-not (Test-Path $base)) { New-Item -ItemType Directory -Path $base -Force | Out-Null }
+
+    $zip = Join-Path $base 'NapCat.Shell.Windows.OneKey.zip'
+    if (-not (Test-Path $zip)) {
+        $paths = @(
+            'https://github.com/NapNeko/NapCatQQ/releases/latest/download/NapCat.Shell.Windows.OneKey.zip',
+            'https://ghproxy.net/https://github.com/NapNeko/NapCatQQ/releases/latest/download/NapCat.Shell.Windows.OneKey.zip',
+            'https://ghfast.top/https://github.com/NapNeko/NapCatQQ/releases/latest/download/NapCat.Shell.Windows.OneKey.zip'
+        )
+        $ok = $false
+        foreach ($u in $paths) {
+            try {
+                Info ('下载：' + $u)
+                Invoke-WebRequest -Uri $u -OutFile $zip -UseBasicParsing -TimeoutSec 120
+                if ((Get-Item $zip).Length -gt 100000) { $ok = $true; break }
+            } catch { Warn ('这个源不行：' + $_.Exception.Message) }
+        }
+        if (-not $ok) {
+            Fail 'NapCat 一体包下载失败（直连和镜像都没通）' ("手动下这个文件放到：" + $zip + "`n地址：https://github.com/NapNeko/NapCatQQ/releases/latest （找 NapCat.Shell.Windows.OneKey.zip）`n放好后再跑一次本脚本，会跳过下载。")
+        }
+        Ok ('下载完成，' + [math]::Round((Get-Item $zip).Length / 1MB, 1) + ' MB')
+    } else {
+        Info ('已有安装包：' + $zip)
+    }
+
+    Expand-Archive -Path $zip -DestinationPath $base -Force
+    $installer = Join-Path $base 'NapCatInstaller.exe'
+    if (-not (Test-Path $installer)) { Fail '一体包里没有 NapCatInstaller.exe' ('解压目录：' + $base + '；包可能下坏了，删掉重下。') }
+
+    Info '开始安装：它会自动下 QQ 客户端（约 300 MB）和 NapCat（约 34 MB），大概 5~10 分钟'
+    $log = Join-Path $script:LogDir ('napcat-onekey-{0}.log' -f (Get-Date -Format 'HHmmss'))
+    $empty = Join-Path $script:Root 'empty.stdin'
+    Set-Content -Path $empty -Value '' -Encoding ASCII
+    $p = Start-Process -FilePath $installer -WorkingDirectory $base `
+        -RedirectStandardInput $empty -RedirectStandardOutput $log -RedirectStandardError ($log + '.err') -PassThru -NoNewWindow
+
+    if (-not $p.WaitForExit(1800000)) {
+        try { $p.Kill() } catch {}
+        Fail 'NapCat 一体包安装超过 30 分钟没结束' ('看日志：' + $log + "`n多半是卡在下载 QQ（300 MB）。网络差就手动跑一次安装器。")
+    }
+    if ($p.ExitCode -ne 0) {
+        $tail = ''
+        if (Test-Path $log) { $tail = (Get-Content $log -Tail 12 | Out-String) }
+        Fail ('NapCat 安装器返回错误码 ' + $p.ExitCode) ("日志末尾：`n" + $tail)
+    }
+
+    $installed = @(Get-ChildItem $base -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^NapCat\.[\d.]+\.Shell$' } |
+        Where-Object { Test-Path (Join-Path $_.FullName 'NapCatWinBootMain.exe') } |
+        Sort-Object LastWriteTime -Descending)
+
+    if ($installed.Count -eq 0) {
+        Fail '安装器跑完了，但没找到装好的目录' ('去 ' + $base + ' 里看看有没有 NapCat.xxxxx.Shell；有就用 -NapCatDir 指过去。日志：' + $log)
+    }
+    Ok ('装好了：' + $installed[0].FullName)
+    return $installed[0].FullName
+}
+
+function Find-NapCat {
+    Step 3 '定位 NapCat'
+
+    if ($NapCatDir) {
+        if (Test-NapCatRoot $NapCatDir) { Ok ('使用指定目录：' + $NapCatDir); return $NapCatDir }
+        Fail ('指定的目录不像 NapCat 根目录：' + $NapCatDir) '要指向含 NapCatWinBootMain.exe 的那层（一体包是 NapCat.xxxxx.Shell），不是 bootmain。'
+    }
+
+    $onekey = Join-Path $script:Root 'napcat-onekey'
+    if (Test-Path $onekey) {
+        $ready = @(Get-ChildItem $onekey -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^NapCat\.[\d.]+\.Shell$' } |
+            Where-Object { Test-Path (Join-Path $_.FullName 'NapCatWinBootMain.exe') } |
+            Sort-Object LastWriteTime -Descending)
+        if ($ready.Count -gt 0) { Ok ('使用已装好的一体包：' + $ready[0].FullName); return $ready[0].FullName }
+    }
+
+    # 用户机器上已有的 NapCat（桌面/下载目录），能直接用就用
+    $searchRoots = @("$env:USERPROFILE\Desktop", "$env:USERPROFILE\Downloads", $script:Root, "$env:ProgramFiles", "$env:LOCALAPPDATA")
+    $candidates = @()
+    foreach ($r in $searchRoots) {
+        if (-not (Test-Path $r)) { continue }
+        foreach ($h in (Get-ChildItem $r -Recurse -Depth 3 -Filter 'NapCatWinBootMain.exe' -ErrorAction SilentlyContinue)) {
+            $candidates += (Split-Path $h.FullName -Parent)
+        }
+    }
+    $good = @()
+    foreach ($c in @($candidates | Select-Object -Unique)) {
+        if (Test-NapCatRoot $c) { $good += $c; continue }
+        $parent = Split-Path $c -Parent
+        if ($parent -and (Test-NapCatRoot $parent)) { $good += $parent }
+    }
+    $good = @($good | Select-Object -Unique)
+    if ($good.Count -ge 1) {
+        $pick = $good[0]
+        if ($good.Count -gt 1) {
+            # 优先自带 QQ 的一体包，其次配置最全的
+            $scored = @($good | ForEach-Object {
+                [pscustomobject]@{ Path = $_; Score = $(if (Test-NapCatSelfContained $_) { 1000 } else { 0 }) + (Get-NapCatConfigDirs $_).Count * 10 - $_.Length / 1000 }
+            })
+            $pick = ($scored | Sort-Object Score -Descending)[0].Path
+        }
+        Ok ('找到现成的 NapCat：' + $pick)
+        Info '如果要改用它自带的 QQ/NapCat，删掉这个目录或加 -NapCatDir 指定别的。'
+        return $pick
+    }
+
+    if ($NapCatMode -eq 'shell') {
+        Warn '按 -NapCatMode shell：下载不带 QQ 的 NapCat（需要客户机器已有 QQ）'
+        $zip2 = Join-Path $script:Root 'NapCat.Shell.zip'
+        try { Invoke-WebRequest -Uri 'https://github.com/NapNeko/NapCatQQ/releases/latest/download/NapCat.Shell.zip' -OutFile $zip2 -UseBasicParsing -TimeoutSec 180 }
+        catch {
+            try { Invoke-WebRequest -Uri 'https://ghproxy.net/https://github.com/NapNeko/NapCatQQ/releases/latest/download/NapCat.Shell.zip' -OutFile $zip2 -UseBasicParsing -TimeoutSec 180 }
+            catch { Fail 'NapCat 下载失败（直连和镜像都没通）' ('手动下 NapCat.Shell.zip 解压，再用 -NapCatDir 指过去。') }
+        }
+        $local = Join-Path $script:Root 'napcat'
+        if (Test-Path $local) { Remove-Item $local -Recurse -Force }
+        New-Item -ItemType Directory -Path $local -Force | Out-Null
+        Expand-Archive -Path $zip2 -DestinationPath $local -Force
+        $boot = Get-ChildItem $local -Recurse -Filter 'NapCatWinBootMain.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $boot) { Fail 'NapCat 解压后没有 NapCatWinBootMain.exe' ('路径：' + $local) }
+        Ok ('NapCat 已部署：' + (Split-Path $boot.FullName -Parent))
+        return (Split-Path $boot.FullName -Parent)
+    }
+
+    return (Install-NapCatOneKey)
+}
+
+function Get-QqClientInfo {
+    $roots = @(
+        'D:\tools Software\QQ',
+        "$env:ProgramFiles\Tencent\QQNT",
+        "${env:ProgramFiles(x86)}\Tencent\QQNT",
+        'C:\Program Files\Tencent\QQ',
+        "$env:LOCALAPPDATA\Programs\Tencent\QQ"
+    )
+    foreach ($r in $roots) {
+        $v = Join-Path $r 'versions'
+        if (-not (Test-Path $v)) { continue }
+        $dirs = @(Get-ChildItem $v -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^\d+\.\d+\.\d+-\d+$' } |
+            Sort-Object LastWriteTime -Descending)
+        if ($dirs.Count -gt 0) { return [pscustomobject]@{ Root = $r; Version = $dirs[0].Name } }
+    }
+    return $null
+}
+
+function Assert-VersionMatch([string]$NapCatPath, $QqInfo) {
+    Step '3.5' '校验 QQ 与 NapCat 版本'
+
+    if (Test-NapCatSelfContained $NapCatPath) {
+        Ok '这是一体包（自带 QQ），版本天生自洽，跳过对比'
+        return
+    }
+
+    if (-not $QqInfo) {
+        Warn '没找到 QQ 客户端安装目录（可能没装，或装在非常规位置）'
+        Info '版本对齐跳过；一旦登录失败，优先怀疑版本不匹配。'
+        return
+    }
+    Ok ('QQ 客户端：' + $QqInfo.Version + '   (' + $QqInfo.Root + ')')
+
+    $qqBuild = $null
+    if ($QqInfo.Version -match '(\d+\.\d+\.\d+)-(\d+)$') { $qqBuild = $Matches[2] }
+    if (-not $qqBuild) { Warn '读不出 QQ 的 build 号，跳过对比'; return }
+
+    $hit = Get-ChildItem $NapCatPath -Recurse -Depth 6 -Filter 'qqnt.json' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $hit) { Info 'NapCat 里没有 qqnt.json，跳过版本对比'; return }
+
+    $meta = Read-Json $hit.FullName
+    $napBuild = [string]$meta.buildVersion
+    Info ('NapCat 认的 QQ build：' + $napBuild + '；你装的是：' + $qqBuild)
+    if ($napBuild -ne '' -and $napBuild -ne $qqBuild) {
+        Warn '版本对不上 —— 这是“登录掉线 / 面板失效”的头号原因'
+        Info '二选一：换一份对得上当前 QQ 的 NapCat；或把 QQ 降回对应版本。'
+    } else {
+        Ok '版本对得上'
+    }
+}
+
+function Set-NapCatConfig([string]$NapCatPath, [string]$QQNumber, [int]$Port, [string]$Token) {
+    Step 5 '把服务端信息写进 NapCat（反向 WS 客户端）'
+
+    $dirs = @(Get-NapCatConfigDirs $NapCatPath)
+    if ($dirs.Count -eq 0) { Fail '找不到 NapCat 的 config 目录' ('路径：' + $NapCatPath + '；NapCat 可能没装完整。') }
+
+    $cfgDir = $null
+    $target = $null
+    foreach ($d in $dirs) {
+        $hit = Get-ChildItem $d -Filter ('onebot11_*' + $QQNumber + '.json') -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($hit) { $cfgDir = $d; $target = $hit.FullName; break }
+    }
+    if (-not $cfgDir) {
+        foreach ($d in $dirs) {
+            $hit = Get-ChildItem $d -Filter 'onebot11_*.json' -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($hit) { $cfgDir = $d; $target = Join-Path $d ('onebot11_' + $QQNumber + '.json'); break }
+        }
+    }
+    if (-not $cfgDir) { $cfgDir = $dirs[0]; $target = Join-Path $cfgDir ('onebot11_' + $QQNumber + '.json') }
+
+    if (-not (Test-Path $cfgDir)) {
+        New-Item -ItemType Directory -Path $cfgDir -Force | Out-Null
+        Info ('配置目录原本不存在，已新建：' + $cfgDir + '（首次启动前就把客户端配好）')
+    }
+    Ok ('配置目录：' + $cfgDir)
+    if ($dirs.Count -gt 1) { Info ('这机器上有 ' + $dirs.Count + ' 处 NapCat 配置，已选最匹配 QQ ' + $QQNumber + ' 的那处。') }
+
+    $store = $null
+    if (Test-Path $target) { Backup-File $target; $store = Read-Json $target }
+    if (-not $store) {
+        $store = [pscustomobject]@{
+            network = [pscustomobject]@{
+                httpServers = @(); httpSseServers = @(); httpClients = @(); websocketServers = @(); plugins = @()
+                websocketClients = @()
+            }
+            musicSignUrl = ''; enableLocalFile2Url = $false; parseMultMsg = $false
+            imageDownloadProxy = ''
+            timeout = [pscustomobject]@{ baseTimeout = 10000; uploadSpeedKBps = 256; downloadSpeedKBps = 256; maxTimeout = 1800000 }
+        }
+    }
+    if (-not $store.network) { $store | Add-Member -NotePropertyName network -NotePropertyValue ([pscustomobject]@{}) -Force }
+    if (-not $store.network.websocketClients) {
+        $store.network | Add-Member -NotePropertyName websocketClients -NotePropertyValue @() -Force
+    }
+
+    $clients = @($store.network.websocketClients)
+    $mine = $clients | Where-Object { $_.name -eq 'dsh-deploy' } | Select-Object -First 1
+    if (-not $mine) { $mine = $clients | Where-Object { $_.url -and $_.url -match (':' + $Port + '/') } | Select-Object -First 1 }
+    if (-not $mine) { $mine = [pscustomobject]@{ name = 'dsh-deploy' }; $clients += $mine }
+
+    $mine.enable = $true
+    $mine.url = 'ws://127.0.0.1:' + $Port + '/ws'
+    $mine.token = $Token
+    $mine.reportSelfMessage = $false
+    $mine.messagePostFormat = 'array'
+    $mine.reconnectInterval = 30000
+    $mine.heartInterval = 30000
+    $mine.verifyCertificate = $true
+    $store.network.websocketClients = $clients
+    Write-Json $target $store
+
+    Ok ('已启用客户端：' + $mine.url)
+    Ok '端口与 token 都和 AstrBot 一致'
+}
+
+function Get-NapCatRunning([string]$NapCatPath) {
+    return @(Get-CimInstance Win32_Process -Filter "Name='NapCatWinBootMain.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($NapCatPath, [StringComparison]::OrdinalIgnoreCase) })
+}
+
+function Restart-NapCat([string]$NapCatPath) {
+    $running = Get-NapCatRunning $NapCatPath
+    if ($running.Count -eq 0) { return }
+    Info ('重启 NapCat 让新配置生效（停掉 PID ' + (($running | ForEach-Object { $_.ProcessId }) -join ',') + '）')
+    foreach ($p in $running) {
+        foreach ($k in @(Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -eq $p.ProcessId })) {
+            Stop-Process -Id $k.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+        Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+    Start-Sleep -Seconds 4
+}
+
+function Start-NapCat([string]$NapCatPath, [string]$QQNumber, [int]$Port) {
+    Step 6 '启动 NapCat 并等扫码'
+
+    $running = Get-NapCatRunning $NapCatPath
+    if ($running.Count -gt 0) { Ok ('NapCat 已在运行（PID ' + (($running | ForEach-Object { $_.ProcessId }) -join ',') + '）') }
+    else {
+        Start-Process -FilePath (Join-Path $NapCatPath 'NapCatWinBootMain.exe') -WorkingDirectory $NapCatPath | Out-Null
+        Ok 'NapCat 已启动（可能弹窗口，别关它）'
+    }
+
+    Start-Sleep -Seconds 2
+    $qr = Get-ChildItem $NapCatPath -Recurse -Filter 'qrcode.png' -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($qr -and ((Get-Date) - $qr.LastWriteTime).TotalSeconds -lt 300) {
+        Info ('登录二维码：' + $qr.FullName)
+        try { Invoke-Item $qr.FullName } catch { Warn '二维码打不开，按上面的路径自己看' }
+    } else {
+        Info '暂时没有二维码：用 QQ 客户端登录一次，或等 NapCat 窗口里出现。'
+    }
+
+    $okWs = Wait-Until { [bool](Get-NetTCPConnection -RemotePort $Port -State Established -ErrorAction SilentlyContinue) } 300 '客户扫码 / 自动登录'
+    if (-not $okWs) {
+        Fail '等了五分钟，NapCat 一直没连上 AstrBot' @"
+按顺序排查：
+
+  1) 二维码过期：重跑本脚本会弹新码
+  2) 扫的不是机器人号：确认扫的是 QQ $QQNumber
+  3) QQ 与 NapCat 版本对不上：看第 3.5 步
+  4) 端口被占用：-OneBotPort 换一个
+  5) 杀软拦了注入：把 NapCat 目录加白名单
+"@
+    }
+    Ok 'NapCat 已连上 AstrBot（反向 WS 通）'
+}
+
+# ── 自检 / 守护 / 回滚 ────────────────────────────────────────────────────
+function Invoke-SelfCheck([int]$Port, $Target) {
+    Step 7 '自检'
+    $bad = 0
+
+    if (Test-PortListen $Port) { Ok ('AstrBot OneBot 端口 ' + $Port + ' 在听') }
+    else { Warn ($Port.ToString() + ' 端口没在听'); $bad++ }
+
+    $abProc = Get-AstrBotProcess
+    if ($abProc.Count -gt 0) { Ok ('AstrBot 进程在（PID ' + (($abProc | ForEach-Object { $_.ProcessId }) -join ',') + '）') }
+    else { Warn 'AstrBot 进程不在'; $bad++ }
+
+    $ball = @(Get-CimInstance Win32_Process -Filter "Name='NapCatWinBootMain.exe'" -ErrorAction SilentlyContinue)
+    if ($ball.Count -gt 0) { Ok ('NapCat 进程在（PID ' + (($ball | ForEach-Object { $_.ProcessId }) -join ',') + '）') }
+    else { Warn 'NapCat 进程不在'; $bad++ }
+
+    if (Get-NetTCPConnection -RemotePort $Port -State Established -ErrorAction SilentlyContinue) { Ok 'NapCat ↔ AstrBot 连接已建立' }
+    else { Warn '两边还没连上（没登录 / 端口不对 / token 不一致）'; $bad++ }
+
+    if ($Target) { Info ('AstrBot 形态：' + $Target.Kind + '，配置：' + $Target.Config) }
+
+    Say ''
+    if ($bad -eq 0) { Say '自检通过：去 QQ 里给机器人发一句话试试。' 'Green' }
+    else { Say ('自检有 ' + $bad + ' 项没过，按上面提示处理。') 'Yellow' }
+    return $bad
+}
+
+function Install-Watchdog {
+    Step 8 '安装守护任务（每 5 分钟自检一次）'
+    $taskName = 'DSH-QQ-Watchdog'
+    $taskArgs = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $PSCommandPath + '" -SelfCheck -Quiet'
+    schtasks /Create /TN $taskName /TR ("powershell " + $taskArgs) /SC MINUTE /MO 5 /F | Out-Null
+    if ($LASTEXITCODE -eq 0) { Ok ('已创建计划任务：' + $taskName) }
+    else { Warn '计划任务创建失败（可能需要管理员身份）' }
+}
+
+function Remove-Deployment {
+    Step 0 '回滚配置'
+    $target = $null
+    if ($AstrBotDir) {
+        $cfg2 = Join-Path $AstrBotDir 'core\data\cmd_config.json'
+        if (Test-Path $cfg2) { $target = $cfg2 }
+        else { $cfg3 = Join-Path $AstrBotDir 'data\cmd_config.json'; if (Test-Path $cfg3) { $target = $cfg3 } }
+    }
+    if (-not $target) {
+        $found = @(Get-LauncherInstances)
+        if ($found.Count -gt 0) { $target = Join-Path $found[0].FullName 'core\data\cmd_config.json' }
+        else { $target = Join-Path (Join-Path $script:Root 'astrbot') 'data\cmd_config.json' }
+    }
+    if (Test-Path $target) {
+        $bak = Get-ChildItem (Split-Path $target -Parent) -Filter 'cmd_config.json.bak-*' -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if ($bak) { Copy-Item $bak.FullName $target -Force; Ok '已还原 AstrBot 配置' }
+        else { Warn '没找到备份，没动 AstrBot 配置' }
+    }
+    schtasks /Delete /TN 'DSH-QQ-Watchdog' /F 2>$null | Out-Null
+    Ok '已删除守护任务（QQ / NapCat / AstrBot 本体没卸载）'
+}
+
+# ── 环境检查 ───────────────────────────────────────────────────────────────
+function Assert-Environment {
+    Step 1 '检查运行环境'
+
+    if ($PSVersionTable.PSVersion.Major -lt 5) { Fail ('PowerShell 版本太低（当前 ' + $PSVersionTable.PSVersion + '）') 'Windows 10/11 自带的 5.1 就够。' }
+    Ok ('PowerShell ' + $PSVersionTable.PSVersion)
+
+    if (-not [Environment]::Is64BitOperatingSystem) { Fail '当前是 32 位系统' 'QQ NT 只支持 64 位 Windows。' }
+    Ok '64 位系统'
+
+    if (-not (Test-Path $script:Root)) { New-Item -ItemType Directory -Path $script:Root -Force | Out-Null }
+    $drive = $script:Root.Substring(0, 1)
+    $free = [math]::Round((Get-PSDrive -Name $drive).Free / 1GB, 1)
+    if ($free -lt 3) { Fail ('磁盘剩余空间不足（' + $free + ' GB）') '至少留 3 GB：Python 3.12 + astrbot + NapCat + 日志。' }
+    Ok ('磁盘剩余 ' + $free + ' GB')
+
+    try { $null = Invoke-WebRequest -Uri 'https://docs.astrbot.app' -UseBasicParsing -TimeoutSec 10; Ok '可以访问 AstrBot 文档站（安装脚本来源）' }
+    catch { Warn '访问 docs.astrbot.app 有点慢或不通，安装那步可能会失败' }
+
+    if (-not (Test-IsAdmin)) { Warn '不是管理员：QQ 装在 Program Files 时 NapCat 注入可能失败，登不上就用管理员重跑。' }
+}
+
+# ── 主流程 ─────────────────────────────────────────────────────────────────
+try {
+    Say ('=== ' + $script:AppName + ' ===') 'Cyan'
+    Say ('时间：' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+
+    if ($Uninstall) { Remove-Deployment; exit 0 }
+
+    if ($SelfCheck) {
+        $p = $OneBotPort
+        $probeCfg = $null
+        $found = @(Get-LauncherInstances)
+        if ($found.Count -gt 0) { $probeCfg = Join-Path $found[0].FullName 'core\data\cmd_config.json' }
+        elseif (Test-Path (Join-Path (Join-Path $script:Root 'astrbot') 'data\cmd_config.json')) { $probeCfg = Join-Path (Join-Path $script:Root 'astrbot') 'data\cmd_config.json' }
+        if ($probeCfg -and (Test-Path $probeCfg)) {
+            $j = Read-Json $probeCfg
+            $pl = @($j.platform) | Where-Object { $_.type -eq 'aiocqhttp' } | Select-Object -First 1
+            if ($pl -and $pl.ws_reverse_port) { $p = [int]$pl.ws_reverse_port }
+        }
+        $bad = Invoke-SelfCheck $p $null
+        if ($bad -gt 0) { exit 1 } else { exit 0 }
+    }
+
+    Assert-Environment
+
+    $ab = Resolve-AstrBot
+    Initialize-AstrBotWorkdir $ab
+    $napRoot = Find-NapCat
+    $qqInfo = Get-QqClientInfo
+    Assert-VersionMatch $napRoot $qqInfo
+
+    if ($Probe) {
+        Step '3.6' '探测结果（-Probe：不写任何配置）'
+        Ok ('AstrBot 形态：' + $ab.Kind)
+        Ok ('AstrBot 根目录：' + $ab.Root)
+        Info ('配置文件将是：' + $ab.Config + '（存在=' + (Test-Path $ab.Config) + '）')
+        Ok ('NapCat 根目录：' + $napRoot)
+        foreach ($d in (Get-NapCatConfigDirs $napRoot)) { Info ('NapCat 配置目录：' + $d) }
+        if ($qqInfo) { Ok ('QQ 客户端：' + $qqInfo.Version + ' @ ' + $qqInfo.Root) }
+        Say ''
+        Say '探测结束，没有改动任何文件。去掉 -Probe 才是真部署。' 'Green'
+        exit 0
+    }
+
+    if (-not $QQ) { $QQ = Read-Host '请输入机器人 QQ 号（纯数字）' }
+    if ($QQ -notmatch '^\d{5,12}$') { Fail ('QQ 号格式不对：' + $QQ) '只填数字，5~12 位。' }
+    if (-not $ApiKey) { $ApiKey = Read-Host '请输入模型 API Key（回车跳过，之后在 WebUI 里填）' }
+
+    if (-not (Test-Path $ab.Config)) {
+        Info '还没配置：先启动一次 AstrBot 让它生成默认配置'
+        if (Stop-AstrBot) { Start-Sleep -Seconds 3 }
+        Start-AstrBot $ab
+        if (-not (Wait-Until { Test-Path $ab.Config } 120 'AstrBot 生成配置文件')) {
+            Fail 'AstrBot 起了但没生成配置文件' ('看日志：' + (Join-Path $script:LogDir 'astrbot.out.log') + "`n常见原因：工作目录没写权限，或 astrbot 命令版本不对。")
+        }
+        Ok '配置已生成'
+    }
+
+    $ob = Set-AstrBotConfig $ab $QQ $ApiKey
+
+    Info '重启 AstrBot 让配置生效'
+    if (Stop-AstrBot) { Start-Sleep -Seconds 3 }
+    Start-AstrBot $ab
+
+    if (-not (Wait-Until { Test-PortListen $ob.Port } 120 ('AstrBot 打开 ' + $ob.Port + ' 端口'))) {
+        $tail = ''
+        $logOut = Join-Path $script:LogDir 'astrbot.out.log'
+        if (Test-Path $logOut) { $tail = (Get-Content $logOut -Tail 15 | Out-String) }
+        Fail ('AstrBot 的 OneBot 端口 ' + $ob.Port + ' 没有起来') ("1) 看日志里平台适配器有没有报错`n2) 端口被占就换：-OneBotPort 8123（脚本会同步改 NapCat）`n日志末尾：`n" + $tail)
+    }
+    Ok ('AstrBot 服务端就绪：' + $ob.Port)
+
+    Set-NapCatConfig $napRoot $QQ $ob.Port $ob.Token
+
+    if (-not $KeepNapCatRunning) {
+        Restart-NapCat $napRoot
+        Start-NapCat $napRoot $QQ $ob.Port
+    } else {
+        Info '按 -KeepNapCatRunning 跳过 NapCat 重启：配置等它下次启动才生效'
+    }
+
+    Invoke-SelfCheck $ob.Port $ab | Out-Null
+
+    if ($InstallWatchdog) { Install-Watchdog }
+
+    Say ''
+    Say '部署完成。' 'Green'
+    Say ('  客户 QQ：' + $QQ)
+    Say '  AstrBot WebUI：http://127.0.0.1:6185'
+    Say ('  日志目录：' + $script:LogDir)
+    Say ''
+    exit 0
+}
+catch {
+    Fail ('未预期的错误：' + $_.Exception.Message) ("这一条不在常见问题里，把日志发给懂行的人看：`n" + $script:LogFile)
+}
