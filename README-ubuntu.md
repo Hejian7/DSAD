@@ -124,7 +124,7 @@ Docker 模式适合：系统仓库里没有 Xvfb、或不想让 QQ 跑在宿主�
 ## 群聊预设（`--group`）
 
 ```bash
-sudo bash deploy.sh --qq 123456789 --api-key sk-xxx --group --wake 鱼 --group-id 987654123
+sudo bash deploy.sh --qq 123456789 --api-key sk-xxx --group --wake 小五 --group-id 946970466
 ```
 
 写的东西和 Windows 版一致：唤醒词、群白名单、每人每分钟 12 条限流、忽略自己的消息、**Agent 权限保持关闭**。
