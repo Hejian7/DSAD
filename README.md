@@ -1,4 +1,4 @@
-# DSH / 大肥鱼 QQ 机器人一键部署
+# AstrBot大肥鱼 QQ 机器人一键部署
 
 把 **AstrBot + NapCat** 接到 QQ 的部署脚本。Windows 和 Ubuntu 各一份，都是「一条命令 → 装好 → 扫一次码」。
 
