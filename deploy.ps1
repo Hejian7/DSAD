@@ -35,6 +35,8 @@ param(
     [string]$NapCatMode = 'auto',
     [ValidateSet('china', 'official')]
     [string]$DownloadSource = 'china',
+    [ValidateSet('Deploy', 'Check', 'Start', 'Stop', 'Status', 'Backup', 'Logs')]
+    [string]$Action = 'Deploy',
     [switch]$SelfCheck,
     [switch]$Probe,
     [switch]$Group,
@@ -810,12 +812,186 @@ function Assert-Environment {
     if (-not (Test-IsAdmin)) { Warn '不是管理员：QQ 装在 Program Files 时 NapCat 注入可能失败，登不上就用管理员重跑。' }
 }
 
+# ── 面向客户的动作（-Action）────────────────────────────────────────────────
+function Resolve-AstrBotExisting {
+    if ($AstrBotDir -and (Test-Path (Join-Path $AstrBotDir 'core\main.py'))) {
+        return [pscustomobject]@{ Kind = 'launcher'; Root = $AstrBotDir; Config = (Join-Path $AstrBotDir 'core\data\cmd_config.json') }
+    }
+    $found = @(Get-LauncherInstances)
+    if ($found.Count -gt 0) {
+        return [pscustomobject]@{ Kind = 'launcher'; Root = $found[0].FullName; Config = (Join-Path $found[0].FullName 'core\data\cmd_config.json') }
+    }
+    $cli = Get-AstrBotCli
+    if ($cli) {
+        $work = $WorkDir
+        if (-not $work) { $work = Join-Path $script:Root 'astrbot' }
+        return [pscustomobject]@{ Kind = 'cli'; Root = $work; Config = (Join-Path $work 'data\cmd_config.json'); Cli = $cli }
+    }
+    return $null
+}
+
+function Get-AnyNapCatRoot {
+    $onekey = Join-Path $script:Root 'napcat-onekey'
+    if (Test-Path $onekey) {
+        $ready = @(Get-ChildItem $onekey -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^NapCat\.[\d.]+\.Shell$' -or (Test-Path (Join-Path $_.FullName 'NapCatWinBootMain.exe')) } |
+            Where-Object { Test-Path (Join-Path $_.FullName 'NapCatWinBootMain.exe') } |
+            Sort-Object LastWriteTime -Descending)
+        if ($ready.Count -gt 0) { return $ready[0].FullName }
+    }
+    foreach ($r in @("$env:USERPROFILE\Desktop", "$env:USERPROFILE\Downloads", $env:ProgramFiles, $env:LOCALAPPDATA)) {
+        if (-not (Test-Path $r)) { continue }
+        foreach ($h in (Get-ChildItem $r -Recurse -Depth 3 -Filter 'NapCatWinBootMain.exe' -ErrorAction SilentlyContinue)) {
+            return (Split-Path $h.FullName -Parent)
+        }
+    }
+    return $null
+}
+
+function Stop-AllNapCat {
+    $procs = @(Get-CimInstance Win32_Process -Filter "Name='NapCatWinBootMain.exe'" -ErrorAction SilentlyContinue)
+    foreach ($p in $procs) {
+        foreach ($k in @(Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -eq $p.ProcessId })) {
+            Stop-Process -Id $k.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+        Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+    return ($procs.Count -gt 0)
+}
+
+function Invoke-ActionCheck {
+    Step '检查' '环境与依赖'
+    Assert-Environment
+
+    $ab = Resolve-AstrBotExisting
+    if ($ab) { Ok ('AstrBot：' + $ab.Kind + ' @ ' + $ab.Root) } else { Warn '没找到 AstrBot（还没部署，或 PATH 没刷新）' }
+    if ($ab -and (Test-Path $ab.Config)) { Ok 'AstrBot 配置存在' } elseif ($ab) { Warn 'AstrBot 配置还没生成（先启动一次）' }
+
+    $nap = Get-AnyNapCatRoot
+    if ($nap) { Ok ('NapCat：' + $nap) } else { Warn '没找到 NapCat（部署时会自动装一体包）' }
+
+    $qq = Get-QqClientInfo
+    if ($qq) { Ok ('QQ 客户端：' + $qq.Version) } else { Info '没检测到 QQ 客户端（一体包模式不需要）' }
+
+    $port = $OneBotPort
+    if ($ab -and (Test-Path $ab.Config)) {
+        $j = Read-Json $ab.Config
+        $pl = @($j.platform) | Where-Object { $_.type -eq 'aiocqhttp' } | Select-Object -First 1
+        if ($pl -and $pl.ws_reverse_port) { $port = [int]$pl.ws_reverse_port }
+    }
+    if (Test-PortListen $port) { Ok ('OneBot 端口 ' + $port + ' 在听') } else { Info ('OneBot 端口 ' + $port + ' 当前没在听（没启动时正常）') }
+    exit 0
+}
+
+function Invoke-ActionStart {
+    Step '启动' '把服务拉起来'
+    $ab = Resolve-AstrBotExisting
+    if (-not $ab) { Fail '还没部署过' '先双击「一键部署.cmd」跑一次；或者用 -Action Deploy 手动部署。' }
+    if (-not (Test-Path $ab.Config)) { Warn '还没生成配置：先跑一次「一键部署.cmd」' }
+
+    Start-AstrBot $ab
+    $port = $OneBotPort
+    if (Test-Path $ab.Config) {
+        $j = Read-Json $ab.Config
+        $pl = @($j.platform) | Where-Object { $_.type -eq 'aiocqhttp' } | Select-Object -First 1
+        if ($pl -and $pl.ws_reverse_port) { $port = [int]$pl.ws_reverse_port }
+    }
+    if (-not (Wait-Until { Test-PortListen $port } 120 ('AstrBot 打开 ' + $port + ' 端口'))) {
+        Fail ('AstrBot 没打开 ' + $port + ' 端口') ("看日志：" + (Join-Path $script:LogDir 'astrbot.out.log') + "`n或者双击「查看日志.cmd」")
+    }
+    Ok ('AstrBot 就绪：' + $port)
+
+    $nap = Get-AnyNapCatRoot
+    if ($nap) {
+        if (@(Get-NapCatRunning $nap).Count -eq 0) {
+            Start-Process -FilePath (Join-Path $nap 'NapCatWinBootMain.exe') -WorkingDirectory $nap | Out-Null
+            Ok 'NapCat 已拉起'
+        } else { Ok 'NapCat 本来就在跑' }
+    } else { Warn '没找到 NapCat：先跑一次「一键部署.cmd」' }
+
+    Invoke-SelfCheck $port $ab | Out-Null
+    exit 0
+}
+
+function Invoke-ActionStop {
+    Step '停止' '把服务关掉（数据保留）'
+    if (Stop-AstrBot) { Ok 'AstrBot 已停止' } else { Info 'AstrBot 本来没在跑' }
+    if (Stop-AllNapCat) { Ok 'NapCat 已停止' } else { Info 'NapCat 本来没在跑' }
+    say_stop_tip
+    exit 0
+}
+
+function say_stop_tip {
+    Info '数据都在，下次「一键启动.cmd」就能接着用'
+}
+
+function Invoke-ActionBackup {
+    Step '备份' '把配置和聊天数据打包'
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $backupDir = Join-Path $script:Root 'backups'
+    if (-not (Test-Path $backupDir)) { New-Item -ItemType Directory -Path $backupDir -Force | Out-Null }
+
+    $items = @()
+    $ab = Resolve-AstrBotExisting
+    if ($ab) {
+        $dataDir = if ($ab.Kind -eq 'launcher') { Join-Path $ab.Root 'core\data' } else { Join-Path $ab.Root 'data' }
+        if (Test-Path $dataDir) { $items += $dataDir }
+    }
+    $nap = Get-AnyNapCatRoot
+    if ($nap) {
+        foreach ($d in (Get-NapCatConfigDirs $nap)) { if (Test-Path $d) { $items += $d } }
+    }
+    if ($items.Count -eq 0) { Fail '没找到可备份的内容' '先部署一次再来备份。' }
+
+    $zip = Join-Path $backupDir ("backup-$stamp.zip")
+    try {
+        Compress-Archive -Path $items -DestinationPath $zip -CompressionLevel Optimal -Force
+    } catch {
+        Fail ('打包失败：' + $_.Exception.Message) '可能文件被占用，先「停止.cmd」再备份。'
+    }
+    $mb = [math]::Round((Get-Item $zip).Length / 1MB, 1)
+    Ok ('备份完成：' + $zip + '（' + $mb + ' MB）')
+
+    $old = @(Get-ChildItem $backupDir -Filter 'backup-*.zip' | Sort-Object LastWriteTime -Descending | Select-Object -Skip 10)
+    foreach ($f in $old) { Remove-Item $f.FullName -Force -ErrorAction SilentlyContinue }
+    if ($old.Count -gt 0) { Info ('保留最近 10 份，已清理 ' + $old.Count + ' 份旧备份') }
+    exit 0
+}
+
+function Invoke-ActionLogs {
+    Step '日志' 'AstrBot 输出（Ctrl+C 退出）'
+    $logOut = Join-Path $script:LogDir 'astrbot.out.log'
+    if (-not (Test-Path $logOut)) { Fail '还没有日志' ('这个文件还不存在：' + $logOut + '；先启动一次服务。') }
+    Get-Content $logOut -Tail 40 -Wait
+    exit 0
+}
+
 # ── 主流程 ─────────────────────────────────────────────────────────────────
+
 try {
     Say ('=== ' + $script:AppName + ' ===') 'Cyan'
     Say ('时间：' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
 
     if ($Uninstall) { Remove-Deployment; exit 0 }
+
+    switch ($Action) {
+        'Check'  { Invoke-ActionCheck }
+        'Start'  { Invoke-ActionStart }
+        'Stop'   { Invoke-ActionStop }
+        'Backup' { Invoke-ActionBackup }
+        'Logs'   { Invoke-ActionLogs }
+        'Status' {
+            $sp = $OneBotPort
+            $sab = Resolve-AstrBotExisting
+            if ($sab -and (Test-Path $sab.Config)) {
+                $sj = Read-Json $sab.Config
+                $spl = @($sj.platform) | Where-Object { $_.type -eq 'aiocqhttp' } | Select-Object -First 1
+                if ($spl -and $spl.ws_reverse_port) { $sp = [int]$spl.ws_reverse_port }
+            }
+            $bad = Invoke-SelfCheck $sp $sab
+            if ($bad -gt 0) { exit 1 } else { exit 0 }
+        }
+    }
 
     if ($SelfCheck) {
         $p = $OneBotPort

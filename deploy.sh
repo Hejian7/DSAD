@@ -33,6 +33,7 @@ INSTALL_DEPS=1
 DO_PROBE=0
 DO_SELF_CHECK=0
 DO_UNINSTALL=0
+ACTION="deploy"
 GROUP_MODE=0
 WAKE_WORD="小五"
 GROUP_ID=""
@@ -82,6 +83,7 @@ usage() {
   --workdir <目录>       AstrBot 工作目录，默认 /opt/dsh-qq-deploy/astrbot
   --source <china|official>  下载源，默认 china
   --no-deps              跳过 apt 依赖安装
+  --action <名字>        deploy|check|start|stop|status|backup|logs（默认 deploy）
   --group                群聊预设：唤醒词 + 群白名单 + 限流，Agent 权限保持关闭
   --wake <词>            唤醒词，默认 小五
   --group-id <群号>      群白名单（可选，之后也能在面板里加）
@@ -102,6 +104,7 @@ while [ $# -gt 0 ]; do
     --workdir) WORK_DIR="${2:-}"; shift 2 ;;
     --source) DOWNLOAD_SOURCE="${2:-}"; shift 2 ;;
     --no-deps) INSTALL_DEPS=0; shift ;;
+    --action) ACTION="${2:-deploy}"; shift 2 ;;
     --group) GROUP_MODE=1; shift ;;
     --wake) WAKE_WORD="${2:-小五}"; shift 2 ;;
     --group-id) GROUP_ID="${2:-}"; shift 2 ;;
@@ -573,7 +576,54 @@ probe() {
   say "探测结束，没有改动任何文件。"
 }
 
+# ── 面向客户的动作（--action）──────────────────────────────────────────────
+action_start() {
+  need_root
+  start_astrbot
+  if have systemctl && systemctl list-unit-files 2>/dev/null | grep -q '^napcat'; then
+    systemctl start napcat || true
+    ok "napcat.service 已启动"
+  elif have napcat; then
+    run_as_user "napcat start" >>"$logfile" 2>&1 || warn "napcat start 返回非零"
+  else
+    warn "没找到 napcat 服务或命令：手动启动一次"
+  fi
+  self_check || true
+}
+
+action_stop() {
+  need_root
+  if have systemctl; then
+    systemctl stop astrbot >/dev/null 2>&1 || true
+    systemctl stop napcat  >/dev/null 2>&1 || true
+  fi
+  pkill -f 'astrbot run' >/dev/null 2>&1 || true
+  ok "已停止（数据保留）"
+}
+
+action_backup() {
+  local stamp; stamp="$(date '+%Y%m%d-%H%M%S')"
+  local bdir="${ROOT_DIR}/backups"; mkdir -p "$bdir"
+  local items=()
+  [ -d "${WORK_DIR}/data" ] && items+=("${WORK_DIR}/data")
+  local ncdir; ncdir="$(napcat_config_dir)"; [ -d "$ncdir" ] && items+=("$ncdir")
+  if [ ${#items[@]} -eq 0 ]; then die "没有可备份的内容" "先部署一次再备份"; fi
+  tar -czf "${bdir}/backup-${stamp}.tar.gz" "${items[@]}" >>"$logfile" 2>&1 || die "打包失败" "文件被占用就先 --action stop 再备份"
+  ok "备份完成：${bdir}/backup-${stamp}.tar.gz"
+  ls -1t "${bdir}"/backup-*.tar.gz 2>/dev/null | tail -n +11 | xargs -r rm -f
+  info "保留最近 10 份"
+}
+
+action_logs() {
+  if have journalctl && systemctl list-unit-files 2>/dev/null | grep -q '^astrbot'; then
+    journalctl -u astrbot -f --no-pager
+  else
+    tail -n 40 -f "${LOG_DIR}/astrbot.out.log"
+  fi
+}
+
 # ── 主流程 ─────────────────────────────────────────────────────────────────
+
 main() {
   say "=== ${APP_NAME} ==="
   say "时间：$(date '+%F %T')"
@@ -581,6 +631,17 @@ main() {
   [ "$DO_UNINSTALL" -eq 1 ] && { need_root; do_uninstall; exit 0; }
   [ "$DO_PROBE" -eq 1 ] && { probe; exit 0; }
   [ "$DO_SELF_CHECK" -eq 1 ] && { self_check || true; exit 0; }
+
+  case "$ACTION" in
+    deploy) : ;;
+    check)  probe; exit 0 ;;
+    start)  action_start; exit 0 ;;
+    stop)   action_stop; exit 0 ;;
+    status) self_check || true; exit 0 ;;
+    backup) need_root; action_backup; exit 0 ;;
+    logs)   action_logs; exit 0 ;;
+    *)      die "未知 --action：${ACTION}" "可用：deploy|check|start|stop|status|backup|logs" ;;
+  esac
 
   [ -n "$QQ" ] || read -r -p "请输入机器人 QQ 号（纯数字）: " QQ
   [[ "$QQ" =~ ^[0-9]{5,12}$ ]] || die "QQ 号格式不对：${QQ}" "只填数字，5~12 位"

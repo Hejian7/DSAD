@@ -1,4 +1,4 @@
-# AstrBot大肥鱼 QQ 机器人一键部署
+# DSH / 大肥鱼 QQ 机器人一键部署
 
 把 **AstrBot + NapCat** 接到 QQ 的部署脚本。Windows 和 Ubuntu 各一份，都是「一条命令 → 装好 → 扫一次码」。
 
@@ -67,3 +67,9 @@ README-ubuntu.md      Ubuntu 使用说明（2C2G 开 swap、headless 登录方�
 
 - Windows：本机实测过探测、配置写入、自检；安装链路按官方脚本实现。
 - Ubuntu：逻辑完整，但**尚未在真机跑过**，已知不确定点写在 [README-ubuntu.md](README-ubuntu.md) 末尾。
+---
+
+## 不想敲命令？
+
+Windows 下直接双击 `一键部署.cmd`；之后日常用 `启动.cmd` / `停止.cmd` / `状态.cmd` / `备份数据.cmd` / `查看日志.cmd`。
+Ubuntu 下用 `--action start|stop|status|backup|logs`。

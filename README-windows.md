@@ -173,3 +173,19 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy.ps1
 - **Agent 执行权限保持关闭**：群里谁都不该让机器人跑命令
 
 `-GroupId` 可以先不给，装完在群里发 `/sid` 拿到群号再补。
+---
+
+## 双击就能用（不用碰 PowerShell）
+
+| 双击这个 | 作用 |
+| --- | --- |
+| `一键部署.cmd` | 第一次部署：装 AstrBot / NapCat、写配置、起服务、出二维码 |
+| `环境检查.cmd` | 只看这台机器能不能跑（不写任何东西） |
+| `启动.cmd` | 已经部署过，把服务拉起来 |
+| `停止.cmd` | 关掉服务，数据保留 |
+| `状态.cmd` | 四项自检：端口 / AstrBot / NapCat / 两端连接 |
+| `备份数据.cmd` | 打包配置与聊天数据，保留最近 10 份 |
+| `查看日志.cmd` | 实时跟日志（Ctrl+C 退出） |
+
+每个 `.cmd` 只是三行壳，实际都调用 `deploy.ps1 -Action <名字>`；
+喜欢命令行的也可以直接：`.\deploy.ps1 -Action Status`

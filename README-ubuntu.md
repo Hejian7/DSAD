@@ -129,3 +129,17 @@ sudo bash deploy.sh --qq 123456789 --api-key sk-xxx --group --wake 鱼 --group-i
 
 写的东西和 Windows 版一致：唤醒词、群白名单、每人每分钟 12 条限流、忽略自己的消息、**Agent 权限保持关闭**。
 群号可以之后用 `/sid` 拿到再补。
+---
+
+## 动作参数（`--action`）
+
+```bash
+sudo bash deploy.sh --action check     # 只看环境
+sudo bash deploy.sh --action start     # 起服务
+sudo bash deploy.sh --action stop      # 停服务（数据保留）
+sudo bash deploy.sh --action status    # 四项自检
+sudo bash deploy.sh --action backup    # 打包配置与数据到 /opt/dsh-qq-deploy/backups
+sudo bash deploy.sh --action logs      # 实时跟日志
+```
+
+不带 `--action` 就是完整部署。
