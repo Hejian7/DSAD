@@ -9,7 +9,7 @@
 
 ---
 
-## 30 秒开始
+## 开始
 
 **Windows**（PowerShell）
 
