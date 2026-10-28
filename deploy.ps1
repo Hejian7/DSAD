@@ -106,13 +106,6 @@ function Backup-File([string]$Path) {
     }
 }
 
-function Set-Prop($Obj, [string]$Name, $Value) {
-    # PSCustomObject 不能直接赋一个不存在的属性：存在就赋值，不存在就加。
-    $prop = $Obj.PSObject.Properties[$Name]
-    if ($prop) { $Obj.$Name = $Value }
-    else { $Obj | Add-Member -NotePropertyName $Name -NotePropertyValue $Value -Force | Out-Null }
-}
-
 function Read-Json([string]$Path) {
     $raw = Get-Content -Path $Path -Raw -Encoding UTF8
     $raw = $raw -replace '^\uFEFF', ''
@@ -326,10 +319,10 @@ function Set-AstrBotConfig($Target, [string]$QQNumber, [string]$Key, [switch]$Gr
         $changed = $true
         Ok ('没有 OneBot 平台，已新建：端口 ' + $OneBotPort)
     } else {
-        if ($plat.enable -ne $true) { Set-Prop $plat 'enable' $true; $changed = $true }
-        if (-not $plat.ws_reverse_port) { Set-Prop $plat 'ws_reverse_port' $OneBotPort; $changed = $true }
+        if ($plat.enable -ne $true) { $plat.enable = $true; $changed = $true }
+        if (-not $plat.ws_reverse_port) { $plat.ws_reverse_port = $OneBotPort; $changed = $true }
         if (-not $plat.ws_reverse_token) {
-            Set-Prop $plat 'ws_reverse_token' (-join ((48..57) + (65..90) + (97..122) | Get-Random -Count 32 | ForEach-Object { [char]$_ }))
+            $plat.ws_reverse_token = (-join ((48..57) + (65..90) + (97..122) | Get-Random -Count 32 | ForEach-Object { [char]$_ }))
             $changed = $true
         }
     }
@@ -670,14 +663,14 @@ function Set-NapCatConfig([string]$NapCatPath, [string]$QQNumber, [int]$Port, [s
     if (-not $mine) { $mine = $clients | Where-Object { $_.url -and $_.url -match (':' + $Port + '/') } | Select-Object -First 1 }
     if (-not $mine) { $mine = [pscustomobject]@{ name = 'dsh-deploy' }; $clients += $mine }
 
-    Set-Prop $mine 'enable' $true
-    Set-Prop $mine 'url' ('ws://127.0.0.1:' + $Port + '/ws')
-    Set-Prop $mine 'token' $Token
-    Set-Prop $mine 'reportSelfMessage' $false
-    Set-Prop $mine 'messagePostFormat' 'array'
-    Set-Prop $mine 'reconnectInterval' 30000
-    Set-Prop $mine 'heartInterval' 30000
-    Set-Prop $mine 'verifyCertificate' $true
+    $mine.enable = $true
+    $mine.url = 'ws://127.0.0.1:' + $Port + '/ws'
+    $mine.token = $Token
+    $mine.reportSelfMessage = $false
+    $mine.messagePostFormat = 'array'
+    $mine.reconnectInterval = 30000
+    $mine.heartInterval = 30000
+    $mine.verifyCertificate = $true
     $store.network.websocketClients = $clients
     Write-Json $target $store
 
