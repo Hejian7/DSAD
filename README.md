@@ -113,10 +113,13 @@ ds-as-nap\
 也可以带参数跑：
 
 ```powershell
-.\uninstall.ps1 -Target all -DryRun   # 只看会删什么，不动手
-.\uninstall.ps1 -Target plugin        # 只删插件
-.\uninstall.ps1 -Target all -Yes      # 全删，不确认
+.\deploy.ps1 -Uninstall -UninstallTarget all -DryRun   # 只看会删什么，不动手
+.\deploy.ps1 -Uninstall -UninstallTarget plugin        # 只删插件
+.\deploy.ps1 -Uninstall -UninstallTarget all -Yes      # 全删，不确认
 ```
+
+卸载逻辑就在 `deploy.ps1` 里（`-Uninstall`），**不再单独需要卸载脚本**——
+安装时只下载 `deploy.ps1` 这一个文件，卸载也是它。
 
 它只删本部署装出来的东西，**不动你自己的 QQ 客户端**。
 全删时还会顺手把 `DSH-QQ-Watchdog` 计划任务清掉，并把老版本散落在用户目录的残留

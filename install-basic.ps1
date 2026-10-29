@@ -62,7 +62,7 @@ Say ('   工作目录：' + $work) 'DarkGray'
 Say ''
 
 # 基础版只拉部署脚本
-$files = @('deploy.ps1', 'uninstall.ps1')
+$files = @('deploy.ps1')
 foreach ($f in $files) {
     if (-not (Get-Remote $f (Join-Path $work $f))) {
         Say ('✗ 拉不到 ' + $f + '：检查网络，或手动从 GitHub 下载放到 ' + $work) 'Red'

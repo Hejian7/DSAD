@@ -61,7 +61,6 @@ Say ''
 # 部署脚本 + 插件包
 $files = @(
     'deploy.ps1',
-    'uninstall.ps1',
     'plugin/install-plugin.ps1',
     'plugin/almost_perfect/main.py',
     'plugin/almost_perfect/metadata.yaml',

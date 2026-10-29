@@ -49,6 +49,10 @@ param(
     [switch]$SkipNetworkCheck,
     [switch]$Preflight,
     [switch]$Uninstall,
+    [ValidateSet('ask', 'astrbot', 'napcat', 'plugin', 'all')]
+    [string]$UninstallTarget = 'ask',
+    [switch]$Yes,
+    [switch]$DryRun,
     [switch]$Quiet
 )
 
@@ -87,7 +91,7 @@ $script:InstallUrl = 'https://docs.astrbot.app/install.ps1'
 
 # uv 默认把下载缓存放到 %LOCALAPPDATA%\uv\cache；钉到这里，别散出去
 $env:UV_CACHE_DIR = Join-Path $script:AsRoot 'uv-cache'
-if (-not (Test-Path $env:UV_CACHE_DIR)) { New-Item -ItemType Directory -Path $env:UV_CACHE_DIR -Force -ErrorAction SilentlyContinue | Out-Null }
+if (-not $Uninstall -and -not (Test-Path $env:UV_CACHE_DIR)) { New-Item -ItemType Directory -Path $env:UV_CACHE_DIR -Force -ErrorAction SilentlyContinue | Out-Null }
 
 # ── 联网 / 进度 / 中断保护 ────────────────────────────────────────────────
 $script:ProxyUrl = $null
@@ -106,7 +110,7 @@ $script:TestApiPort = 31777
 # 双击两次是最常见的人为事故：两个部署同时改同一份配置，最后谁对谁错说不清
 function Enter-DeployLock {
     try {
-        if (-not (Test-Path $script:Root)) { New-Item -ItemType Directory -Path $script:Root -Force | Out-Null }
+        if (-not $Uninstall -and -not (Test-Path $script:Root)) { New-Item -ItemType Directory -Path $script:Root -Force | Out-Null }
         if (Test-Path $script:LockFile) {
             $raw = (Get-Content $script:LockFile -Raw -ErrorAction SilentlyContinue)
             $oldPid = 0
@@ -643,9 +647,13 @@ function Get-PreviousRun {
 
 # ── 输出 ───────────────────────────────────────────────────────────────────
 function Write-Log([string]$Text) {
-    if (-not (Test-Path $script:LogDir)) { New-Item -ItemType Directory -Path $script:LogDir -Force | Out-Null }
-    $line = '[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Text
-    Add-Content -Path $script:LogFile -Value $line -Encoding UTF8
+    # 卸载时会把自己的安装目录删掉（日志本来就在里面），所以这里必须容错，
+    # 不能因为写不进日志就把整个卸载判成失败。
+    try {
+        if (-not (Test-Path $script:LogDir)) { New-Item -ItemType Directory -Path $script:LogDir -Force -ErrorAction Stop | Out-Null }
+        $line = '[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Text
+        Add-Content -Path $script:LogFile -Value $line -Encoding UTF8 -ErrorAction Stop
+    } catch { }
 }
 function Say([string]$Text, [string]$Color = 'Gray') {
     if (-not $Quiet) { Write-Host $Text -ForegroundColor $Color }
@@ -2209,27 +2217,136 @@ function Install-Watchdog {
     else { Warn '计划任务创建失败（可能需要管理员身份）' }
 }
 
-function Remove-Deployment {
-    Step 0 '回滚配置'
-    $target = $null
-    if ($AstrBotDir) {
-        $cfg2 = Join-Path $AstrBotDir 'core\data\cmd_config.json'
-        if (Test-Path $cfg2) { $target = $cfg2 }
-        else { $cfg3 = Join-Path $AstrBotDir 'data\cmd_config.json'; if (Test-Path $cfg3) { $target = $cfg3 } }
+function Get-PathMb([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return -1 }
+    $it = Get-Item -LiteralPath $Path -Force
+    if (-not $it.PSIsContainer) { return [double]$it.Length }
+    $m = Get-ChildItem -LiteralPath $Path -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum
+    return [double]$m.Sum
+}
+
+# 卸载：可选只删 AstrBot / 只删 NapCat / 只删插件 / 全删。
+# 这个能力并进 deploy.ps1，客户就不用额外拿一个卸载脚本了。
+function Invoke-UninstallMenu {
+    $target = $UninstallTarget
+    if ($target -eq 'ask') {
+        Say ''
+        Say '============================================================' 'Cyan'
+        Say '   卸载：要删哪些？' 'Cyan'
+        Say '============================================================' 'Cyan'
+        Say ''
+        Say '   1) 只删 AstrBot（本体 + 配置 + 插件都在里面）'
+        Say '   2) 只删 NapCat（含它自带的那份 QQ）'
+        Say '   3) 只删看门狗插件 Almost perfect'
+        Say '   4) 全删（AstrBot + NapCat + 插件 + 日志缓存 + 历史遗留）'
+        Say '   0) 退出'
+        Say ''
+        do { $c = Read-Host '   输入 1 / 2 / 3 / 4 / 0' } until ($c -match '^[0-4]$')
+        switch ($c) {
+            '0' { Say '   已退出，什么都没有改动。' 'Yellow'; return 0 }
+            '1' { $target = 'astrbot' }
+            '2' { $target = 'napcat' }
+            '3' { $target = 'plugin' }
+            '4' { $target = 'all' }
+        }
     }
-    if (-not $target) {
-        $found = @(Get-LauncherInstances)
-        if ($found.Count -gt 0) { $target = Join-Path $found[0].FullName 'core\data\cmd_config.json' }
-        else { $target = Join-Path ($script:AbDir) 'data\cmd_config.json' }
+
+    $abDir = $script:AbDir
+    $ncDir = $script:NcDir
+    $plugDir = Join-Path $abDir 'data\plugins\almost_perfect'
+    $legacy = @(
+        (Join-Path $env:LOCALAPPDATA 'dsh-qq-deploy'),
+        (Join-Path $env:APPDATA 'uv\tools\astrbot'),
+        (Join-Path $env:USERPROFILE '.astrbot_launcher'),
+        (Join-Path $env:USERPROFILE 'Desktop\NapCat.Shell.Windows.OneKey'),
+        (Join-Path $env:USERPROFILE '.local\bin\astrbot.exe')
+    )
+
+    $todo = @()
+    Say ''
+    Say '   将要删除：' 'White'
+    $add = {
+        param($label, $path)
+        $mb = Get-PathMb $path
+        if ($mb -lt 0) { Say ('   · ' + $label + '：不存在（' + $path + '）') 'DarkGray'; return }
+        Say ('   · ' + $label + '：{0:N1} MB  {1}' -f ($mb / 1MB), $path)
+        $script:unTodo += @{ Path = $path }
     }
-    if (Test-Path $target) {
-        $bak = Get-ChildItem (Split-Path $target -Parent) -Filter 'cmd_config.json.bak-*' -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime -Descending | Select-Object -First 1
-        if ($bak) { Copy-Item $bak.FullName $target -Force; Ok '已还原 AstrBot 配置' }
-        else { Warn '没找到备份，没动 AstrBot 配置' }
+    $script:unTodo = @()
+
+    switch ($target) {
+        'plugin' { & $add '看门狗插件' $plugDir }
+        'astrbot' { & $add 'AstrBot（含配置与插件）' $abDir }
+        'napcat' { & $add 'NapCat（含自带 QQ）' $ncDir }
+        'all' {
+            & $add '整个安装目录' $script:AsRoot
+            foreach ($p in $legacy) { & $add '历史遗留' $p }
+        }
     }
-    schtasks /Delete /TN 'DSH-QQ-Watchdog' /F 2>$null | Out-Null
-    Ok '已删除守护任务（QQ / NapCat / AstrBot 本体没卸载）'
+    $todo = $script:unTodo
+
+    if ($todo.Count -eq 0) { Say ''; Say '   没有要删的东西，可能已经删过了。' 'Yellow'; return 0 }
+
+    $total = 0
+    foreach ($t in $todo) { $s = Get-PathMb $t.Path; if ($s -gt 0) { $total += $s } }
+    Say ''
+    Say ('   合计约 {0:N1} MB' -f ($total / 1MB)) 'Yellow'
+
+    if ($DryRun) { Say ''; Say '   -DryRun：只看不删。' 'Green'; return 0 }
+
+    if (-not $Yes) {
+        Say ''
+        $a = Read-Host '   确认删除吗？不可撤销 (y/N)'
+        if ($a -notmatch '^[yY]') { Say '   已取消，什么都没有改动。' 'Yellow'; return 0 }
+    }
+
+    Say ''
+    Say '   先停相关进程……' 'DarkGray'
+    if ($target -eq 'astrbot' -or $target -eq 'plugin' -or $target -eq 'all') {
+        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+            $_.Name -eq 'astrbot.exe' -or ($_.Name -eq 'python.exe' -and $_.ExecutablePath -and $_.ExecutablePath.StartsWith($abDir, [StringComparison]::OrdinalIgnoreCase))
+        } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    }
+    if ($target -eq 'napcat' -or $target -eq 'all') {
+        Get-CimInstance Win32_Process -Filter "Name='NapCatWinBootMain.exe'" -ErrorAction SilentlyContinue |
+            ForEach-Object { cmd /c ('taskkill /F /T /PID ' + $_.ProcessId) 2>&1 | Out-Null }
+    }
+    Start-Sleep -Seconds 2
+
+    $failed = 0
+    foreach ($t in $todo) {
+        try {
+            if (Test-Path -LiteralPath $t.Path) { Remove-Item -LiteralPath $t.Path -Recurse -Force -ErrorAction Stop }
+            if (Test-Path -LiteralPath $t.Path) { Say ('   ✗ 没删干净：' + $t.Path) 'Red'; $failed++ }
+            else { Say ('   √ 已删：' + $t.Path) 'Green' }
+        } catch {
+            Say ('   ✗ 删除失败：' + $t.Path) 'Red'
+            Say ('     ' + $_.Exception.Message) 'DarkGray'
+            $failed++
+        }
+    }
+
+    if ($target -eq 'all') {
+        # 任务不存在时 schtasks 会往 stderr 打 "ERROR: ..."，在 Stop 模式下会被当成异常，
+        # 所以整体兜住：删不掉也不影响卸载结果
+        $oldEap = $ErrorActionPreference
+        $ErrorActionPreference = 'SilentlyContinue'
+        try {
+            $q = (schtasks /Query /TN 'DSH-QQ-Watchdog' 2>&1 | Out-String)
+            if ($q -match 'DSH-QQ-Watchdog') {
+                $null = (schtasks /Delete /TN 'DSH-QQ-Watchdog' /F 2>&1 | Out-String)
+                Say '   √ 已删除计划任务：DSH-QQ-Watchdog' 'Green'
+            }
+        } catch {
+        } finally {
+            $ErrorActionPreference = $oldEap
+        }
+    }
+
+    Say ''
+    if ($failed -eq 0) { Say '   卸载完成。' 'Green'; return 0 }
+    Say ('  有 ' + $failed + ' 项没删掉，通常是进程还占着文件。关掉相关窗口再试。') 'Yellow'
+    return 1
 }
 
 # ── 环境检查 ───────────────────────────────────────────────────────────────
@@ -2430,7 +2547,12 @@ try {
     Initialize-NetClient
     Enable-CtrlCGuard
 
-    if ($Uninstall) { Remove-Deployment; exit 0 }
+    if ($Uninstall) {
+    # 卸载会把安装目录整个删掉，日志不能写在里面，改到临时目录
+    $script:LogDir = $env:TEMP
+    $script:LogFile = Join-Path $env:TEMP ('dsad-uninstall-{0}.log' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    exit (Invoke-UninstallMenu)
+}
 
     # 双击两次会起两个部署，互相覆盖配置——直接拦下
     if ($Action -eq 'Deploy' -and -not $Probe -and -not $SelfCheck -and -not $Preflight) { Enter-DeployLock }
