@@ -2001,77 +2001,35 @@ function Invoke-SelfCheck([int]$Port, $Target) {
     return $bad
 }
 
-# ── Almost perfect 插件：NapCat 掉线自愈 ─────────────────────────────────
-# 插件跑在 AstrBot 进程里：NapCat 挂了它还在，修好之后能借恢复的连接报喜。
-function Install-AlmostPerfectPlugin($AstrBotTarget, [string]$NapCatRoot, [int]$Port, [string]$Owner, [string]$SourceDir = '') {
-    Step '7.5' '安装看门狗插件 Almost perfect'
+# ── 选装插件 ──────────────────────────────────────────────────────────────
+# 本脚本只负责装软件。插件是选装件：升级版的安装包里会多带一个
+# plugin\install-plugin.ps1，看到它就交给它装；没有就说明是基础版，跳过。
+# 这样"基础款 / 升级版"的差别只在包里有没有这个文件，部署脚本不用分支。
+function Invoke-OptionalPluginInstaller($AstrBotTarget, [string]$NapCatRoot, [int]$Port, [string]$Owner) {
+    $repoRoot = $PSScriptRoot
+    if (-not $repoRoot) { $repoRoot = Split-Path -Parent $PSCommandPath }
+    $installer = Join-Path $repoRoot 'plugin\install-plugin.ps1'
 
-    if (-not $SourceDir) {
-        $repoRoot = $PSScriptRoot
-        if (-not $repoRoot) { $repoRoot = Split-Path -Parent $PSCommandPath }
-        $SourceDir = Join-Path $repoRoot 'plugin\almost_perfect'
-    }
-    $srcDir = $SourceDir
-    if (-not (Test-Path $srcDir)) {
-        Warn ('插件源码不在：' + $srcDir + '（跳过，不影响主流程）')
+    if (-not (Test-Path $installer)) {
+        Info '基础版：包里没有插件安装器，跳过选装插件'
         return
     }
 
+    Step '7.5' '安装选装插件（Almost perfect）'
     if ($AstrBotTarget.Kind -eq 'launcher') {
         $dataDir = Join-Path $AstrBotTarget.Root 'core\data'
     } else {
         $dataDir = Join-Path $AstrBotTarget.Root 'data'
     }
-    $dstDir = Join-Path $dataDir 'plugins\almost_perfect'
-    $cfgPath = Join-Path $dstDir 'settings.json'
-
-    # 先记住客户改过的配置：下面整目录覆盖会把 settings.json 也盖掉
-    $oldCfg = $null
-    if (Test-Path $cfgPath) {
-        try { $oldCfg = Read-Json $cfgPath } catch { }
-    }
 
     try {
-        if (-not (Test-Path $dstDir)) { New-Item -ItemType Directory -Path $dstDir -Force | Out-Null }
-        Copy-Item (Join-Path $srcDir '*') -Destination $dstDir -Recurse -Force
-    } catch {
-        Warn ('插件复制失败：' + $_.Exception.Message)
-        return
-    }
-
-    # 兜底：插件里的 .ps1 必须带 UTF-8 BOM，否则 PS 5.1 按 GBK 读会直接语法崩
-    foreach ($ps1 in @(Get-ChildItem $dstDir -Filter '*.ps1' -ErrorAction SilentlyContinue)) {
-        try {
-            $b = [System.IO.File]::ReadAllBytes($ps1.FullName)
-            if ($b.Length -gt 2 -and -not ($b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF)) {
-                $txt = [System.Text.Encoding]::UTF8.GetString($b).TrimStart([char]0xFEFF)
-                [System.IO.File]::WriteAllText($ps1.FullName, $txt, [System.Text.UTF8Encoding]::new($true))
-                Info ('已给 ' + $ps1.Name + ' 补上 UTF-8 BOM')
-            }
-        } catch { }
-    }
-
-    # 配置：优先沿用客户原来那份（上面已备份），只把机器相关的填进去
-    $cfg = $oldCfg
-    if (-not $cfg -and (Test-Path $cfgPath)) {
-        try { $cfg = Read-Json $cfgPath } catch { }
-    }
-    if (-not $cfg) {
-        $cfg = [pscustomobject]@{
-            enabled = $true; napcat_dir = ''; onebot_port = 6199; owner_qq = ''
-            check_interval_sec = 60; max_repair_per_hour = 3
-            backoff_seconds = @(30, 120, 300, 900); repair_script = 'repair.ps1'
+        & $installer -AstrBotDataDir $dataDir -NapCatRoot $NapCatRoot -Port $Port -Owner $Owner
+        if ($LASTEXITCODE -ne 0) {
+            Warn '插件安装器返回了失败（不影响机器人本体）'
         }
+    } catch {
+        Warn ('插件安装出错：' + $_.Exception.Message + '（不影响机器人本体）')
     }
-    Set-Prop $cfg 'napcat_dir' $NapCatRoot
-    Set-Prop $cfg 'onebot_port' $Port
-    if ($Owner) { Set-Prop $cfg 'owner_qq' $Owner }
-    if (-not ($cfg.PSObject.Properties.Name -contains 'enabled')) { Set-Prop $cfg 'enabled' $true }
-    Write-Json $cfgPath $cfg
-
-    Ok ('插件已就位：' + $dstDir)
-    Ok ('看门狗：每 ' + [int]$cfg.check_interval_sec + ' 秒查一次，每小时最多修 ' + [int]$cfg.max_repair_per_hour + ' 次')
-    Info '重启 AstrBot 后生效；QQ 里发 /ap 可以看状态'
 }
 
 function Install-Watchdog {
@@ -2415,8 +2373,8 @@ try {
     if (-not $adminQQ) { $adminQQ = $QQ }
     $ob = Set-AstrBotConfig $ab $adminQQ $ApiKey -GroupMode:$Group -Wake $WakeWord -Gid $GroupId
 
-    # 插件要在 AstrBot 启动前放好，启动时才会加载
-    Install-AlmostPerfectPlugin $ab $napRoot $ob.Port $OwnerQQ | Out-Null
+    # 插件是选装：包里带 install-plugin.ps1 就装，没带就是基础版
+    Invoke-OptionalPluginInstaller $ab $napRoot $ob.Port $OwnerQQ | Out-Null
 
     Info '重启 AstrBot 让配置生效'
     if (Stop-AstrBot) { Start-Sleep -Seconds 3 }

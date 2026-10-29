@@ -43,21 +43,46 @@ sudo bash linuxdsq/deploy.sh --qq 123456789 --api-key sk-xxxx
 
 ---
 
+## 两个版本：基础版 / 升级版
+
+客户拿到的入口只有两个：
+
+| 版本 | 入口 | 拉什么 | 装什么 |
+| --- | --- | --- | --- |
+| 基础版 | `安装-基础版.cmd` | 只拉 `deploy.ps1` | 只装软件（AstrBot + NapCat） |
+| 升级版 | `安装-升级版.cmd` | `deploy.ps1` + `plugin/` 整个插件包 | 软件 + 看门狗插件 |
+
+**区别不在于部署脚本写了分支，而在于包里有没有 `plugin/install-plugin.ps1`。**
+部署脚本装完软件后会去 `plugin\` 底下看一眼：
+- 有 `install-plugin.ps1` → 直接执行它 → 插件被装进 AstrBot
+- 没有 → 打印「基础版：包里没有插件安装器，跳过选装插件」，继续自检收尾
+
+所以以后加新插件，只要在 `plugin/` 里放个同名安装器，部署脚本不用改。
+
+```
+install-basic.ps1      基础版入口（下载 deploy.ps1 后执行）
+install-plus.ps1       升级版入口（多拉 plugin/ 整个包）
+安装-基础版.cmd         给客户双击的壳
+安装-升级版.cmd         给客户双击的壳
+deploy.ps1             Windows 部署脚本（只管装软件 + 有插件就调安装器）
+```
+
 ## 仓库结构
 
 ```
+install-basic.ps1 / install-plus.ps1   两个版本的入口
 deploy.ps1            Windows 部署脚本
 linuxdsq/deploy.sh    Ubuntu / Debian 部署脚本
 README-windows.md     Windows 使用说明
 README-ubuntu.md      Ubuntu 使用说明（2C2G 开 swap、headless 登录方式）
 docs/                 设计与规划文档（架构、待办）
-plugin/almost_perfect/  看门狗插件（部署时自动装进 AstrBot）
+plugin/install-plugin.ps1   插件安装器（存在 = 升级版）
+plugin/almost_perfect/      看门狗插件本体
 ```
 
-## 看门狗插件 Almost perfect
+## 看门狗插件 Almost perfect（选装）
 
-部署脚本会把 `plugin/almost_perfect/` 自动装进 AstrBot 的 `data/plugins/`，并填好
-NapCat 目录与端口。它做的是**掉线自愈**：
+只有升级版会带上它。它做的是**掉线自愈**：
 
 - 每 60 秒检查 NapCat 进程 + 与 AstrBot 的连接
 - 掉线就修：停干净 → 拉起 → 等自动登录 → 等连回来
