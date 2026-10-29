@@ -2003,10 +2003,15 @@ function Invoke-SelfCheck([int]$Port, $Target) {
 
 # ── Almost perfect 插件：NapCat 掉线自愈 ─────────────────────────────────
 # 插件跑在 AstrBot 进程里：NapCat 挂了它还在，修好之后能借恢复的连接报喜。
-function Install-AlmostPerfectPlugin($AstrBotTarget, [string]$NapCatRoot, [int]$Port, [string]$Owner) {
+function Install-AlmostPerfectPlugin($AstrBotTarget, [string]$NapCatRoot, [int]$Port, [string]$Owner, [string]$SourceDir = '') {
     Step '7.5' '安装看门狗插件 Almost perfect'
 
-    $srcDir = Join-Path $PSScriptRoot 'plugin\almost_perfect'
+    if (-not $SourceDir) {
+        $repoRoot = $PSScriptRoot
+        if (-not $repoRoot) { $repoRoot = Split-Path -Parent $PSCommandPath }
+        $SourceDir = Join-Path $repoRoot 'plugin\almost_perfect'
+    }
+    $srcDir = $SourceDir
     if (-not (Test-Path $srcDir)) {
         Warn ('插件源码不在：' + $srcDir + '（跳过，不影响主流程）')
         return
