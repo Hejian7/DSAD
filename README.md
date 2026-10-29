@@ -51,12 +51,27 @@ linuxdsq/deploy.sh    Ubuntu / Debian 部署脚本
 README-windows.md     Windows 使用说明
 README-ubuntu.md      Ubuntu 使用说明（2C2G 开 swap、headless 登录方式）
 docs/                 设计与规划文档（架构、待办）
+plugin/almost_perfect/  看门狗插件（部署时自动装进 AstrBot）
 ```
+
+## 看门狗插件 Almost perfect
+
+部署脚本会把 `plugin/almost_perfect/` 自动装进 AstrBot 的 `data/plugins/`，并填好
+NapCat 目录与端口。它做的是**掉线自愈**：
+
+- 每 60 秒检查 NapCat 进程 + 与 AstrBot 的连接
+- 掉线就修：停干净 → 拉起 → 等自动登录 → 等连回来
+- 修好了发一条「修复完成」；修不好只写日志（此时机器人在断线状态，发不出去）
+- 防反复重启：失败退避 30s→2min→5min→15min，每小时最多 3 次
+
+QQ 里发 `/ap` 看状态，`/ap repair` 手动修一次，`/ap off` 关掉自动修复。
+详见 [plugin/almost_perfect/README.md](plugin/almost_perfect/README.md)。
 
 > **改 `deploy.ps1` 的人注意：这个文件必须带 UTF-8 BOM。**
 > 目标运行时是 Windows PowerShell 5.1，没有 BOM 它会按系统 ANSI（中文机器上是 GBK）读，
 > 中文全部乱码，甚至直接报一串 `Unexpected token` 语法错误。
 > 用编辑器另存为「UTF-8 带 BOM」；批量替换/脚本改写过之后，务必检查文件开头是不是 `EF BB BF`。
+> 插件里的 `repair.ps1` 同理（部署脚本会对它做 BOM 兜底）。
 
 ---
 

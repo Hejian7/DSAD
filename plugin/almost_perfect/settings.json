@@ -1,0 +1,11 @@
+{
+  "enabled": true,
+  "napcat_dir": "",
+  "onebot_port": 6199,
+  "owner_qq": "",
+  "check_interval_sec": 60,
+  "max_repair_per_hour": 3,
+  "backoff_seconds": [30, 120, 300, 900],
+  "repair_script": "repair.ps1",
+  "quiet_hours": []
+}

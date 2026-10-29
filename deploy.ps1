@@ -1983,6 +1983,68 @@ function Invoke-SelfCheck([int]$Port, $Target) {
     return $bad
 }
 
+# ── Almost perfect 插件：NapCat 掉线自愈 ─────────────────────────────────
+# 插件跑在 AstrBot 进程里：NapCat 挂了它还在，修好之后能借恢复的连接报喜。
+function Install-AlmostPerfectPlugin($AstrBotTarget, [string]$NapCatRoot, [int]$Port, [string]$Owner) {
+    Step '7.5' '安装看门狗插件 Almost perfect'
+
+    $srcDir = Join-Path $PSScriptRoot 'plugin\almost_perfect'
+    if (-not (Test-Path $srcDir)) {
+        Warn ('插件源码不在：' + $srcDir + '（跳过，不影响主流程）')
+        return
+    }
+
+    if ($AstrBotTarget.Kind -eq 'launcher') {
+        $dataDir = Join-Path $AstrBotTarget.Root 'core\data'
+    } else {
+        $dataDir = Join-Path $AstrBotTarget.Root 'data'
+    }
+    $dstDir = Join-Path $dataDir 'plugins\almost_perfect'
+
+    try {
+        if (-not (Test-Path $dstDir)) { New-Item -ItemType Directory -Path $dstDir -Force | Out-Null }
+        Copy-Item (Join-Path $srcDir '*') -Destination $dstDir -Recurse -Force
+    } catch {
+        Warn ('插件复制失败：' + $_.Exception.Message)
+        return
+    }
+
+    # 兜底：插件里的 .ps1 必须带 UTF-8 BOM，否则 PS 5.1 按 GBK 读会直接语法崩
+    foreach ($ps1 in @(Get-ChildItem $dstDir -Filter '*.ps1' -ErrorAction SilentlyContinue)) {
+        try {
+            $b = [System.IO.File]::ReadAllBytes($ps1.FullName)
+            if ($b.Length -gt 2 -and -not ($b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF)) {
+                $txt = [System.Text.Encoding]::UTF8.GetString($b).TrimStart([char]0xFEFF)
+                [System.IO.File]::WriteAllText($ps1.FullName, $txt, [System.Text.UTF8Encoding]::new($true))
+                Info ('已给 ' + $ps1.Name + ' 补上 UTF-8 BOM')
+            }
+        } catch { }
+    }
+
+    # 配置：保留客户改过的项，只把机器相关的填进去
+    $cfgPath = Join-Path $dstDir 'settings.json'
+    $cfg = $null
+    if (Test-Path $cfgPath) {
+        try { $cfg = Read-Json $cfgPath } catch { }
+    }
+    if (-not $cfg) {
+        $cfg = [pscustomobject]@{
+            enabled = $true; napcat_dir = ''; onebot_port = 6199; owner_qq = ''
+            check_interval_sec = 60; max_repair_per_hour = 3
+            backoff_seconds = @(30, 120, 300, 900); repair_script = 'repair.ps1'
+        }
+    }
+    Set-Prop $cfg 'napcat_dir' $NapCatRoot
+    Set-Prop $cfg 'onebot_port' $Port
+    if ($Owner) { Set-Prop $cfg 'owner_qq' $Owner }
+    if (-not ($cfg.PSObject.Properties.Name -contains 'enabled')) { Set-Prop $cfg 'enabled' $true }
+    Write-Json $cfgPath $cfg
+
+    Ok ('插件已就位：' + $dstDir)
+    Ok ('看门狗：每 ' + [int]$cfg.check_interval_sec + ' 秒查一次，每小时最多修 ' + [int]$cfg.max_repair_per_hour + ' 次')
+    Info '重启 AstrBot 后生效；QQ 里发 /ap 可以看状态'
+}
+
 function Install-Watchdog {
     Step 8 '安装守护任务（每 5 分钟自检一次）'
     $taskName = 'DSH-QQ-Watchdog'
@@ -2323,6 +2385,9 @@ try {
     $adminQQ = $OwnerQQ
     if (-not $adminQQ) { $adminQQ = $QQ }
     $ob = Set-AstrBotConfig $ab $adminQQ $ApiKey -GroupMode:$Group -Wake $WakeWord -Gid $GroupId
+
+    # 插件要在 AstrBot 启动前放好，启动时才会加载
+    Install-AlmostPerfectPlugin $ab $napRoot $ob.Port $OwnerQQ | Out-Null
 
     Info '重启 AstrBot 让配置生效'
     if (Stop-AstrBot) { Start-Sleep -Seconds 3 }

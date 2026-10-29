@@ -1,0 +1,5 @@
+name: almost_perfect
+desc: NapCat 掉线自愈——检测、重启、等它连回来；修好才发消息，修不好只留日志
+version: 0.1.0
+author: DSAD
+repo: https://github.com/Hejian7/DSAD
