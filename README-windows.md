@@ -37,6 +37,44 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy.ps1
 .\deploy.ps1 -Uninstall
 ```
 
+```powershell
+# 跳过联网预检（已经知道网是好的，省几十秒）
+.\deploy.ps1 -QQ 123456789 -SkipNetworkCheck
+```
+
+---
+
+## 网络差、机器乱的时候
+
+这类机器（公司网、安全软件、老系统、装过一堆东西）最容易出现"看着在跑，其实早就死了"。
+脚本按下面的方式来避免：
+
+**1. 联网预检（第 1.1 步）**
+开工前先逐条探路：AstrBot 文档站、清华/阿里/cernet 三个 PyPI 镜像、npmmirror 的 Python、
+GitHub 直连、ghproxy。每条 5 秒超时，结果直接打在屏幕上（通了给毫秒数，不通标出来）。
+
+- 系统代理会被自动识别（环境变量 → IE 设置），并且**先探活再使用**：代理死了就自动改直连，
+  不会因为一个坏代理把整台机器误判成"没网"。
+- 一个 PyPI 镜像都不通 → 直接停在第一步，告诉你该查联网、代理还是 DNS，而不是让你干等十分钟。
+- GitHub 不通会明确提示：NapCat 会走镜像，官方安装脚本里的 uv 下载会失败。
+- 老系统上还会强制打开 TLS 1.2/1.3——不打开的话下载会报"基础连接已经关闭"这种鬼话。
+
+**2. 全程有进度**
+- 下载：字节级进度条（`12.3/20.3 MB 61% 1.8 MB/s`），支持断点重试、可选 sha256 校验。
+- 装 AstrBot / 装 NapCat：显示已用时间 + **日志最后一行的实时尾巴**，不再是黑屏干等十几分钟。
+- 标题栏同步显示当前阶段，最小化也能知道在干嘛。
+
+**3. 装一半被关掉？**
+- 安装期间**窗口的关闭按钮会被摘掉**，误点 X 关不掉；装完自动恢复（`finally` 里恢复，
+  中途报错也会恢复）。
+- 按 Ctrl+C：第一下不杀，先收拾现场；**要真中止得连按两次**。
+- 万一被强杀、断电、任务管理器结束：会留下断点标记 `%LOCALAPPDATA%\dsh-qq-deploy\.install-in-progress.json`，
+  下次运行会明确告诉你"上次卡在哪个阶段"，重跑接着装，已经装好的不重装。
+
+> 内部约定：本脚本**不要用 `Invoke-WebRequest @参数表`（splatting）**。实测在装了安全软件的
+> 机器上，这种写法会让 PowerShell 5.1 无声无息整个退出（退出码 0、没有任何报错），极难排查。
+> 网络请求统一走 `HttpWebRequest`。
+
 ---
 
 ## AstrBot 的两种形态
@@ -55,7 +93,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy.ps1
 
 ## 它到底做了什么
 
-1. **环境检查**：PowerShell 5.1+、64 位、磁盘 ≥3 GB、能否访问 `docs.astrbot.app`、是否管理员。
+1. **环境检查**：PowerShell 5.1+、64 位、磁盘 ≥3 GB、**联网预检**（各下载源是否可达、代理是否活着）、是否管理员。
 2. **AstrBot**：没装就下载官方 `install.ps1`，用 `-Language zh-CN -DownloadSource china -NonInteractive` 跑（下载走大陆镜像，Python 3.12 走 USTC 源）；装完找 `astrbot` 命令（PATH / `%USERPROFILE%\.local\bin` / `%APPDATA%\uv\tools\astrbot`）。
 3. **初始化**：CLI 形态建工作目录并 `astrbot init`；没生成配置就先 `astrbot run` 一次把它逼出来。
 4. **写 AstrBot**：`aiocqhttp` 平台（端口 + token，没有就建、有就沿用）、DeepSeek 模型（给了 Key 才写）、把你的 QQ 加进管理员。

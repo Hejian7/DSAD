@@ -44,6 +44,7 @@ param(
     [string]$GroupId = '',
     [switch]$KeepNapCatRunning,
     [switch]$InstallWatchdog,
+    [switch]$SkipNetworkCheck,
     [switch]$Uninstall,
     [switch]$Quiet
 )
@@ -57,6 +58,394 @@ $script:Root = Join-Path $env:LOCALAPPDATA 'dsh-qq-deploy'
 $script:LogDir = Join-Path $script:Root 'logs'
 $script:LogFile = Join-Path $script:LogDir ('deploy-{0}.log' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
 $script:InstallUrl = 'https://docs.astrbot.app/install.ps1'
+
+# ── 联网 / 进度 / 中断保护 ────────────────────────────────────────────────
+$script:ProxyUrl = $null
+$script:Net = @{}
+$script:InterruptRequested = $false
+$script:CtrlCGuardOn = $false
+$script:CtrlCStrikes = 0
+$script:GuardLoaded = $false
+$script:CurrentStage = ''
+$script:MarkerFile = Join-Path $script:Root '.install-in-progress.json'
+
+function Set-WindowTitle([string]$Text) {
+    if ($Quiet) { return }
+    try { $Host.UI.RawUI.WindowTitle = 'DSH 部署 · ' + $Text } catch { }
+}
+
+# 输出被重定向到文件/管道时，\r 原地刷新只会刷出一堆空格和空行，直接关掉
+function Test-InlineAllowed {
+    if ($Quiet) { return $false }
+    try { if ([Console]::IsOutputRedirected) { return $false } } catch { }
+    return $true
+}
+
+# 单行原地刷新（下载进度、安装计时都靠它）
+function Write-Inline([string]$Text) {
+    if (-not (Test-InlineAllowed)) { return }
+    try {
+        $w = $Host.UI.RawUI.WindowSize.Width
+        if ($w -gt 20 -and $Text.Length -ge ($w - 1)) { $Text = $Text.Substring(0, $w - 2) }
+        Write-Host ("`r" + $Text.PadRight(78)) -NoNewline -ForegroundColor DarkGray
+    } catch { }
+}
+function Clear-Inline {
+    if (-not (Test-InlineAllowed)) { return }
+    Write-Host ("`r" + (' ' * 78) + "`r") -NoNewline
+}
+
+# TLS 1.2/1.3 + 系统代理：老机器上最常见的两类“莫名其妙连不上”
+function Initialize-NetClient {
+    try {
+        $t = [Net.SecurityProtocolType]::Tls12
+        if ([Enum]::GetNames([Net.SecurityProtocolType]) -contains 'Tls13') {
+            $t = $t -bor [Net.SecurityProtocolType]::Tls13
+        }
+        [Net.ServicePointManager]::SecurityProtocol = $t
+    } catch { }
+    try { [Net.ServicePointManager]::DefaultConnectionLimit = 16 } catch { }
+
+    foreach ($k in @('HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy')) {
+        $v = [Environment]::GetEnvironmentVariable($k)
+        if ($v) { $script:ProxyUrl = $v; break }
+    }
+    if (-not $script:ProxyUrl) {
+        try {
+            $ie = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction Stop
+            if ($ie.ProxyEnable -eq 1 -and $ie.ProxyServer) {
+                $s = [string]$ie.ProxyServer
+                if ($s -notmatch '^[a-z]+://') { $s = 'http://' + $s }
+                $script:ProxyUrl = $s
+            }
+        } catch { }
+    }
+    if ($script:ProxyUrl) {
+        # 注册表里有代理不等于它活着：探一下，死了就丢掉，别让它把整台机器拖成“没网”
+        $probe = Test-Endpoint -Url 'https://www.baidu.com' -TimeoutSec 6
+        if ($probe.Ok) {
+            Info ('检测到系统代理：' + $script:ProxyUrl + '（活着，下载走它）')
+        } else {
+            $direct = Test-Endpoint -Url 'https://www.baidu.com' -TimeoutSec 6
+            $why = '，已改为直连'
+            if (-not $direct.Ok) { $why = '，直连也不通' }
+            Warn ('系统代理 ' + $script:ProxyUrl + ' 连不通' + $why)
+            $script:ProxyUrl = $null
+        }
+    }
+}
+
+# 注意：这里刻意不用 Invoke-WebRequest 的 splatting（@参数表）。
+# 实测在装了安全软件的机器上，`Invoke-WebRequest @p` 会让 PowerShell 5.1
+# 无声无息地整个进程退出（退出码 0、无报错），排查成本极高。
+# 直接用 HttpWebRequest，行为和超时都可控。
+function Test-Endpoint([string]$Url, [int]$TimeoutSec = 5, [switch]$Head) {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $ms = 0
+    try {
+        $req = [System.Net.HttpWebRequest]::Create($Url)
+        $req.UserAgent = 'DSH-Deploy/1.0'
+        $req.Timeout = $TimeoutSec * 1000
+        $req.ReadWriteTimeout = $TimeoutSec * 1000
+        $req.AllowAutoRedirect = $true
+        if ($Head) { $req.Method = 'HEAD' }
+        if ($script:ProxyUrl) { $req.Proxy = New-Object System.Net.WebProxy($script:ProxyUrl, $true) }
+        $resp = $req.GetResponse()
+        $code = [int]$resp.StatusCode
+        $resp.Close()
+        $sw.Stop()
+        return [pscustomobject]@{ Ok = $true; Ms = [int]$sw.ElapsedMilliseconds; Status = $code; Error = '' }
+    } catch [System.Net.WebException] {
+        $sw.Stop()
+        $ms = [int]$sw.ElapsedMilliseconds
+        $we = $_.Exception
+        try {
+            if ($we.Response) {
+                $code = [int]$we.Response.StatusCode
+                $we.Response.Close()
+                # 4xx/5xx 说明网络是通的，只是这个地址不欢迎 HEAD 或裸访问
+                if ($code -ge 200 -and $code -lt 500) {
+                    return [pscustomobject]@{ Ok = $true; Ms = $ms; Status = $code; Error = $we.Message }
+                }
+            }
+        } catch { }
+        return [pscustomobject]@{ Ok = $false; Ms = $ms; Status = 0; Error = $we.Message }
+    } catch {
+        $sw.Stop()
+        return [pscustomobject]@{ Ok = $false; Ms = [int]$sw.ElapsedMilliseconds; Status = 0; Error = $_.Exception.Message }
+    }
+}
+
+# 联网预检：先把“哪条路通”问清楚，再决定后面怎么下载
+function Test-NetworkProfile {
+    Step '1.1' '联网预检（每条路 5 秒超时，最多几十秒）'
+    Set-WindowTitle '联网预检'
+
+    $targets = @(
+        [pscustomobject]@{ Key = 'astrbot'; Name = 'AstrBot 文档站'; Url = 'https://docs.astrbot.app/install.ps1'; Must = $true },
+        [pscustomobject]@{ Key = 'pypi_tuna'; Name = '清华 PyPI'; Url = 'https://pypi.tuna.tsinghua.edu.cn/simple/uv/'; Must = $true },
+        [pscustomobject]@{ Key = 'pypi_ali'; Name = '阿里 PyPI'; Url = 'https://mirrors.aliyun.com/pypi/simple/uv/'; Must = $false },
+        [pscustomobject]@{ Key = 'pypi_cernet'; Name = 'cernet PyPI'; Url = 'https://mirrors.cernet.edu.cn/pypi/web/simple/uv/'; Must = $false },
+        [pscustomobject]@{ Key = 'python'; Name = 'npmmirror Py3.12'; Url = 'https://registry.npmmirror.com/-/binary/python/3.12.10/python-3.12.10-amd64.exe'; Must = $false },
+        [pscustomobject]@{ Key = 'github'; Name = 'GitHub 直连'; Url = 'https://github.com'; Must = $false },
+        [pscustomobject]@{ Key = 'ghproxy'; Name = 'ghproxy 镜像'; Url = 'https://ghproxy.net'; Must = $false }
+    )
+
+    $i = 0
+    foreach ($t in $targets) {
+        $i++
+        Write-Inline ("    检测 {0}/{1}  {2} …" -f $i, $targets.Count, $t.Name)
+        $r = Test-Endpoint -Url $t.Url -TimeoutSec 5 -Head
+        $script:Net[$t.Key] = $r.Ok
+        Clear-Inline
+        if ($r.Ok) {
+            Say ("    √ {0,-16} {1,5} ms" -f $t.Name, $r.Ms) 'Green'
+        } else {
+            $tag = if ($t.Must) { '（这条必须通）' } else { '' }
+            Say ("    ! {0,-16} 不通 {1}" -f $t.Name, $tag) 'Yellow'
+        }
+    }
+
+    $pypiOk = $script:Net['pypi_tuna'] -or $script:Net['pypi_ali'] -or $script:Net['pypi_cernet']
+    $script:Net['pypi_any'] = [bool]$pypiOk
+
+    Say ''
+    if ($pypiOk -and $script:Net['astrbot']) {
+        Ok '基础网络可用：PyPI 镜像与文档站都在'
+    } elseif ($pypiOk) {
+        Warn 'PyPI 镜像通，但 AstrBot 文档站不通 —— 官方安装脚本可能取不到'
+    } else {
+        Fail '一个 PyPI 镜像都不通，装不了 AstrBot' @"
+三条都试过了：清华、阿里、cernet。这通常意味着：
+  1) 机器根本没联网（先浏览器打开任意网页试试）
+  2) 公司/校园网要认证或走代理（设好代理后重跑，脚本会自动识别系统代理）
+  3) DNS 坏了：换 223.5.5.5 / 119.29.29.29 再试
+实在不行，手机开热点给这台机器跑一次。
+"@
+    }
+
+    if (-not $script:Net['github']) {
+        Warn 'GitHub 直连不通 —— NapCat 会走 ghproxy 镜像；官方 install.ps1 里的 uv 下载也会失败'
+        if (-not $script:Net['ghproxy']) { Warn 'ghproxy 也不通：NapCat 大概率装不上，需要手动放安装包（脚本会告诉你放哪）' }
+    } else {
+        Ok 'GitHub 直连可用'
+    }
+}
+
+# 带进度条的下载：字节级进度 + 重试 + 可选 sha256
+function Get-FileWithProgress {
+    param(
+        [string]$Url,
+        [string]$OutFile,
+        [string]$Label = '',
+        [string]$Sha256 = '',
+        [int]$MaxRetry = 2,
+        [int]$StallTimeoutSec = 90
+    )
+    if (-not $Label) { $Label = Split-Path $OutFile -Leaf }
+    $dir = Split-Path $OutFile -Parent
+    if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+
+    $tmp = $OutFile + '.part'
+    for ($attempt = 1; $attempt -le $MaxRetry; $attempt++) {
+        if ($attempt -gt 1) { Info ('重试第 ' + $attempt + ' 次：' + $Label) }
+        try {
+            if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
+            $req = [System.Net.HttpWebRequest]::Create($Url)
+            $req.Method = 'GET'
+            $req.UserAgent = 'DSH-Deploy/1.0'
+            $req.Timeout = 20000
+            $req.ReadWriteTimeout = $StallTimeoutSec * 1000
+            if ($script:ProxyUrl) { $req.Proxy = New-Object System.Net.WebProxy($script:ProxyUrl, $true) }
+
+            $resp = $req.GetResponse()
+            try {
+                $total = $resp.ContentLength
+                $in = $resp.GetResponseStream()
+                $out = [System.IO.File]::Create($tmp)
+                $buf = New-Object byte[] 65536
+                $done = 0L
+                $lastPaint = [DateTime]::MinValue
+                $sw = [Diagnostics.Stopwatch]::StartNew()
+                try {
+                    while ($true) {
+                        if ($script:InterruptRequested) { throw '用户已请求中断' }
+                        $n = $in.Read($buf, 0, $buf.Length)
+                        if ($n -le 0) { break }
+                        $out.Write($buf, 0, $n)
+                        $done += $n
+                        $now = Get-Date
+                        if (($now - $lastPaint).TotalMilliseconds -ge 300) {
+                            $lastPaint = $now
+                            $mb = $done / 1MB
+                            if ($total -gt 0) {
+                                $pct = [int](100 * $done / $total)
+                                $spd = 0.0
+                                if ($sw.Elapsed.TotalSeconds -gt 0.5) { $spd = ($done / 1MB) / $sw.Elapsed.TotalSeconds }
+                                Write-Inline ('    ↓ {0}   {1:N1}/{2:N1} MB   {3}%   {4:N1} MB/s' -f $Label, $mb, ($total / 1MB), $pct, $spd)
+                                Set-WindowTitle ('下载 ' + $Label + ' ' + $pct + '%')
+                            } else {
+                                Write-Inline ('    ↓ {0}   {1:N1} MB' -f $Label, $mb)
+                                Set-WindowTitle ('下载 ' + $Label + ' ' + ('{0:N1}' -f $mb) + ' MB')
+                            }
+                        }
+                    }
+                } finally {
+                    $out.Close(); $in.Close()
+                }
+            } finally {
+                $resp.Close()
+            }
+            Clear-Inline
+            if ($total -gt 0 -and $done -ne $total) { throw ('下载不完整（' + $done + '/' + $total + ' 字节）') }
+            if ($Sha256) {
+                $h = (Get-FileHash $tmp -Algorithm SHA256).Hash.ToLower()
+                if ($h -ne $Sha256.ToLower()) { throw '文件校验失败（sha256 不匹配）' }
+            }
+            if (Test-Path $OutFile) { Remove-Item $OutFile -Force -ErrorAction SilentlyContinue }
+            Move-Item $tmp $OutFile -Force
+            return $true
+        } catch {
+            Clear-Inline
+            if ($script:InterruptRequested) { throw }
+            if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
+            if ($attempt -eq $MaxRetry) { throw }
+            Warn ('下载出错：' + $_.Exception.Message)
+            Start-Sleep -Seconds 2
+        }
+    }
+    return $false
+}
+
+# 多个源轮流试，第一个成功的算数
+function Get-FileFromMirrors {
+    param([object[]]$Mirrors, [string]$OutFile, [string]$Sha256 = '', [int]$MaxRetry = 2)
+    $file = Split-Path $OutFile -Leaf
+    foreach ($m in $Mirrors) {
+        Info ('下载 {0}  ←  {1}' -f $file, $m.Name)
+        Write-Inline ('    · ' + $m.Url)
+        Start-Sleep -Milliseconds 150
+        Clear-Inline
+        try {
+            $null = Get-FileWithProgress -Url $m.Url -OutFile $OutFile -Label $m.Name -Sha256 $Sha256 -MaxRetry $MaxRetry
+            Ok ('下载完成（{0:N1} MB，源：{1}）' -f ((Get-Item $OutFile).Length / 1MB), $m.Name)
+            return $true
+        } catch {
+            if ($script:InterruptRequested) { throw }
+            Warn ('这个源不行（' + $m.Name + '）：' + $_.Exception.Message)
+        }
+    }
+    return $false
+}
+
+# 子进程跑到一半的“进度”：计时 + 日志尾巴，避免黑屏干等
+function Wait-ProcessWithProgress {
+    param($Process, [string]$Label, [int]$TimeoutSec = 900, [string]$LogPath = '')
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $lastLine = ''
+    while (-not $Process.HasExited) {
+        if ($script:InterruptRequested) {
+            try { $Process.Kill() } catch { }
+            throw '用户已请求中断'
+        }
+        $elapsed = [int]$sw.Elapsed.TotalSeconds
+        if ($elapsed -gt $TimeoutSec) {
+            try { $Process.Kill() } catch { }
+            return -2
+        }
+        if ($LogPath -and (Test-Path $LogPath)) {
+            try {
+                $tail = @(Get-Content $LogPath -Tail 1 -ErrorAction SilentlyContinue)
+                if ($tail.Count -gt 0 -and $tail[0]) { $lastLine = ([string]$tail[0]).Trim() }
+            } catch { }
+        }
+        $t = '{0:00}:{1:00}' -f [math]::Floor($elapsed / 60), ($elapsed % 60)
+        if ($lastLine) { Write-Inline ('    ⏳ {0}   [{1}]   {2}' -f $Label, $t, $lastLine) }
+        else { Write-Inline ('    ⏳ {0}   [{1}]   启动中…' -f $Label, $t) }
+        Set-WindowTitle ($Label + ' ' + $t)
+        Start-Sleep -Milliseconds 800
+    }
+    Clear-Inline
+    return $Process.ExitCode
+}
+
+# ── 中断保护：关窗按钮 + Ctrl+C + 断点标记 ─────────────────────────────────
+function Initialize-ConsoleGuard {
+    if ($script:GuardLoaded) { return }
+    try {
+        if (-not ('DSHDeploy.ConsoleGuard' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace DSHDeploy {
+    public static class ConsoleGuard {
+        [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+        [DllImport("user32.dll")] public static extern IntPtr GetSystemMenu(IntPtr hWnd, bool bRevert);
+        [DllImport("user32.dll")] public static extern bool DeleteMenu(IntPtr hMenu, uint uPosition, uint uFlags);
+        [DllImport("user32.dll")] public static extern bool DrawMenuBar(IntPtr hWnd);
+    }
+}
+'@ -ErrorAction Stop
+        }
+        $script:GuardLoaded = [bool]('DSHDeploy.ConsoleGuard' -as [type])
+    } catch { $script:GuardLoaded = $false }
+}
+
+# 安装期间摘掉窗口的关闭按钮：误点 X 关不掉，就不存在“装到一半没了”
+function Set-CloseButton([bool]$Enabled) {
+    Initialize-ConsoleGuard
+    if (-not $script:GuardLoaded) { return }
+    try {
+        $h = [DSHDeploy.ConsoleGuard]::GetConsoleWindow()
+        if ($h -eq [IntPtr]::Zero) { return }
+        if ($Enabled) {
+            $null = [DSHDeploy.ConsoleGuard]::GetSystemMenu($h, $true)
+        } else {
+            $menu = [DSHDeploy.ConsoleGuard]::GetSystemMenu($h, $false)
+            $null = [DSHDeploy.ConsoleGuard]::DeleteMenu($menu, 0xF060, 0)
+            $null = [DSHDeploy.ConsoleGuard]::DrawMenuBar($h)
+        }
+    } catch { }
+}
+
+function Enable-CtrlCGuard {
+    if ($script:CtrlCGuardOn) { return }
+    $script:CtrlCGuardOn = $true
+    try {
+        [Console]::CancelKeyPress += {
+            param($sender, $e)
+            $script:CtrlCStrikes = [int]$script:CtrlCStrikes + 1
+            if ($script:CtrlCStrikes -ge 2) { $e.Cancel = $false; return }
+            $e.Cancel = $true
+            $script:InterruptRequested = $true
+            Write-Host ''
+            Write-Host '  ! 收到 Ctrl+C：这一下不当场杀，先收拾现场。' -ForegroundColor Yellow
+            Write-Host '    要强制结束，再按一次 Ctrl+C。' -ForegroundColor Yellow
+        }
+    } catch { }
+}
+
+function Write-RunMarker([string]$Stage) {
+    $script:CurrentStage = $Stage
+    try {
+        if (-not (Test-Path $script:Root)) { New-Item -ItemType Directory -Path $script:Root -Force | Out-Null }
+        $o = [ordered]@{
+            stage = $Stage
+            pid   = $PID
+            at    = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+        }
+        ($o | ConvertTo-Json) | Set-Content -Path $script:MarkerFile -Encoding UTF8
+    } catch { }
+}
+
+function Clear-RunMarker {
+    Remove-Item $script:MarkerFile -Force -ErrorAction SilentlyContinue
+}
+
+function Get-PreviousRun {
+    if (-not (Test-Path $script:MarkerFile)) { return $null }
+    try { return (Get-Content $script:MarkerFile -Raw -Encoding UTF8 | ConvertFrom-Json) } catch { return $null }
+}
 
 # ── 输出 ───────────────────────────────────────────────────────────────────
 function Write-Log([string]$Text) {
@@ -128,6 +517,7 @@ function Test-PortListen([int]$Port) {
 function Wait-Until([scriptblock]$Condition, [int]$TimeoutSec, [string]$ProgressText = '') {
     $deadline = (Get-Date).AddSeconds($TimeoutSec)
     while ((Get-Date) -lt $deadline) {
+        if ($script:InterruptRequested) { throw '用户已请求中断' }
         if (& $Condition) {
             if ($ProgressText -ne '' -and -not $Quiet) { Write-Host '' }
             return $true
@@ -165,33 +555,63 @@ function Get-AstrBotCli {
 }
 
 function Install-AstrBot {
-    Step '2.1' ('官方脚本部署 AstrBot（下载源：' + $DownloadSource + '）')
+    Step '2.1' ('部署 AstrBot（下载源：' + $DownloadSource + '）')
 
     $ps1 = Join-Path $script:Root 'install.astrbot.ps1'
     if (-not (Test-Path $script:Root)) { New-Item -ItemType Directory -Path $script:Root -Force | Out-Null }
-    try {
-        Info ('下载安装脚本：' + $script:InstallUrl)
-        Invoke-WebRequest -Uri $script:InstallUrl -OutFile $ps1 -UseBasicParsing -TimeoutSec 60
-    } catch {
-        Fail '下载 AstrBot 安装脚本失败' ("访问不了 docs.astrbot.app。`n1) 检查网络/代理；2) 手动打开 " + $script:InstallUrl + " 让客户跑一遍，再回来重跑本脚本（会自动认出已装好的 astrbot）。`n详细：" + $_.Exception.Message)
+
+    if (-not (Test-Path $ps1)) {
+        Info ('取安装脚本：' + $script:InstallUrl)
+        try {
+            $null = Get-FileWithProgress -Url $script:InstallUrl -OutFile $ps1 -Label 'install.ps1' -MaxRetry 3
+        } catch {
+            Fail '下载 AstrBot 安装脚本失败' ("docs.astrbot.app 取不到。`n1) 回头看第一步的联网预检：文档站是不是标了不通`n2) 设好系统代理再重跑（脚本会自动识别）`n3) 或者用浏览器打开 " + $script:InstallUrl + "，另存为：" + $ps1 + "`n详细：" + $_.Exception.Message)
+        }
+        Ok ('安装脚本已就位（{0:N0} KB）' -f ((Get-Item $ps1).Length / 1KB))
+    } else {
+        Info ('复用已下载的安装脚本：' + $ps1)
     }
 
-    Info '开始安装：uv + Python 3.12 + astrbot（第一次要几分钟，别关窗口）'
+    Info '接下来装 uv + Python 3.12 + astrbot，第一次 3~10 分钟，进度会实时刷'
+    if ($script:Net.ContainsKey('github') -and -not $script:Net['github']) {
+        Warn 'GitHub 不通：官方脚本内部要下的 uv 大概率失败，失败后按提示走手动方案'
+    }
+    Warn '安装期间窗口关闭按钮会失效（防误关）；真要中止，连按两次 Ctrl+C'
+    Set-CloseButton $false
+    Write-RunMarker '安装 AstrBot'
     $log = Join-Path $script:LogDir ('astrbot-install-{0}.log' -f (Get-Date -Format 'HHmmss'))
-    $proc = Start-Process -FilePath 'powershell.exe' `
-        -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $ps1, '-Language', 'zh-CN', '-DownloadSource', $DownloadSource, '-NonInteractive') `
-        -RedirectStandardOutput $log -RedirectStandardError ($log + '.err') -PassThru -NoNewWindow
 
-    if (-not $proc.WaitForExit(900000)) {
-        try { $proc.Kill() } catch {}
-        Fail 'AstrBot 安装超过 15 分钟没结束' ("可能卡在下载（网络）。看日志里最后几行：`n" + $log + "`n也可以手动在 PowerShell 里跑一遍安装脚本，成功后再执行本脚本。")
+    try {
+        $proc = Start-Process -FilePath 'powershell.exe' `
+            -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $ps1, '-Language', 'zh-CN', '-DownloadSource', $DownloadSource, '-NonInteractive') `
+            -RedirectStandardOutput $log -RedirectStandardError ($log + '.err') -PassThru -NoNewWindow
+
+        $code = Wait-ProcessWithProgress -Process $proc -Label '安装 AstrBot' -TimeoutSec 900 -LogPath $log
+        if ($code -eq -2) {
+            Fail 'AstrBot 安装超过 15 分钟没动静' ("多半卡在下载。日志：" + $log + "`n先跑一次 -Action Check 看装到哪一步了。")
+        }
+        if ($code -ne 0) {
+            $tail = ''
+            if (Test-Path $log) { $tail = (Get-Content $log -Tail 12 | Out-String) }
+            $extra = ''
+            if ($script:Net.ContainsKey('github') -and -not $script:Net['github']) {
+                $extra = "`n这台机器的典型死法：官方脚本先去 USTC 镜像取 uv，USTC 对大文件回 403；它再退回 GitHub，GitHub 又不通 → 直接 exit 1。`n手动绕过：换台能上网的机器跑一次 " + $script:InstallUrl + "（或手机热点），装好 uv 后回来重跑本脚本，会自动认出。"
+            }
+            Fail ('AstrBot 安装脚本返回错误码 ' + $code) ("1) 看下面日志末尾`n2) 换网络重试（手机热点最省事）`n3) 别加 -DownloadSource official：国内那条路更差" + $extra + "`n`n日志末尾：`n" + $tail)
+        }
+    } finally {
+        Set-CloseButton $true
     }
-    if ($proc.ExitCode -ne 0) {
-        $tail = ''
-        if (Test-Path $log) { $tail = (Get-Content $log -Tail 12 | Out-String) }
-        Fail ('AstrBot 安装脚本返回了错误码 ' + $proc.ExitCode) ("常见原因：下载源不通、代理没开、或已有 uv 冲突。`n1) 换源重试：-DownloadSource official`n2) 看日志末尾：`n" + $tail)
+
+    if (-not (Get-AstrBotCli)) {
+        Fail '安装脚本说成功了，但找不到 astrbot 命令' @"
+PATH 可能没刷新。按顺序试：
+  1) 关掉窗口重开一个 PowerShell，再跑本脚本（会自动认出）
+  2) where.exe astrbot
+  3) 看日志：$log
+"@
     }
-    Ok '官方安装脚本执行完成'
+    Ok 'AstrBot 装好了'
 }
 
 function Resolve-AstrBot {
@@ -439,46 +859,54 @@ function Install-NapCatOneKey {
 
     $zip = Join-Path $base 'NapCat.Shell.Windows.OneKey.zip'
     if (-not (Test-Path $zip)) {
-        $paths = @(
-            'https://github.com/NapNeko/NapCatQQ/releases/latest/download/NapCat.Shell.Windows.OneKey.zip',
-            'https://ghproxy.net/https://github.com/NapNeko/NapCatQQ/releases/latest/download/NapCat.Shell.Windows.OneKey.zip',
-            'https://ghfast.top/https://github.com/NapNeko/NapCatQQ/releases/latest/download/NapCat.Shell.Windows.OneKey.zip'
-        )
-        $ok = $false
-        foreach ($u in $paths) {
-            try {
-                Info ('下载：' + $u)
-                Invoke-WebRequest -Uri $u -OutFile $zip -UseBasicParsing -TimeoutSec 120
-                if ((Get-Item $zip).Length -gt 100000) { $ok = $true; break }
-            } catch { Warn ('这个源不行：' + $_.Exception.Message) }
+        $onekeyPath = 'NapNeko/NapCatQQ/releases/latest/download/NapCat.Shell.Windows.OneKey.zip'
+        $mirrors = @()
+        # 直连能不能用，预检已经告诉过我们了；通的排前面，省时间
+        if (-not $script:Net.ContainsKey('github') -or $script:Net['github']) {
+            $mirrors += [pscustomobject]@{ Name = 'GitHub 直连'; Url = ('https://github.com/' + $onekeyPath) }
         }
+        $mirrors += [pscustomobject]@{ Name = 'ghproxy'; Url = ('https://ghproxy.net/https://github.com/' + $onekeyPath) }
+        $mirrors += [pscustomobject]@{ Name = 'ghfast'; Url = ('https://ghfast.top/https://github.com/' + $onekeyPath) }
+        if (-not $script:Net.ContainsKey('github') -or $script:Net['github']) {
+            $mirrors += [pscustomobject]@{ Name = 'GitHub 直连（重试）'; Url = ('https://github.com/' + $onekeyPath) }
+        }
+
+        $ok = Get-FileFromMirrors -Mirrors $mirrors -OutFile $zip
         if (-not $ok) {
-            Fail 'NapCat 一体包下载失败（直连和镜像都没通）' ("手动下这个文件放到：" + $zip + "`n地址：https://github.com/NapNeko/NapCatQQ/releases/latest （找 NapCat.Shell.Windows.OneKey.zip）`n放好后再跑一次本脚本，会跳过下载。")
+            Fail 'NapCat 一体包下载失败（所有源都没通）' ("手动下这个文件放到：`n" + $zip + "`n地址：https://github.com/NapNeko/NapCatQQ/releases/latest （找 NapCat.Shell.Windows.OneKey.zip）`n放好后再跑一次本脚本，会跳过下载。")
         }
-        Ok ('下载完成，' + [math]::Round((Get-Item $zip).Length / 1MB, 1) + ' MB')
+        if ((Get-Item $zip).Length -lt 100000) { Fail '下载到的文件太小，不像安装包' ('删掉重试：' + $zip) }
     } else {
-        Info ('已有安装包：' + $zip)
+        Info ('已有安装包，跳过下载：' + $zip)
     }
 
     Expand-Archive -Path $zip -DestinationPath $base -Force
     $installer = Join-Path $base 'NapCatInstaller.exe'
     if (-not (Test-Path $installer)) { Fail '一体包里没有 NapCatInstaller.exe' ('解压目录：' + $base + '；包可能下坏了，删掉重下。') }
 
-    Info '开始安装：它会自动下 QQ 客户端（约 300 MB）和 NapCat（约 34 MB），大概 5~10 分钟'
+    Info '安装器会自己下 QQ 客户端（约 300 MB）和 NapCat（约 34 MB），5~10 分钟，进度实时刷'
+    Warn '安装期间窗口关闭按钮会失效（防误关）；真要中止，连按两次 Ctrl+C'
     $log = Join-Path $script:LogDir ('napcat-onekey-{0}.log' -f (Get-Date -Format 'HHmmss'))
     $empty = Join-Path $script:Root 'empty.stdin'
     Set-Content -Path $empty -Value '' -Encoding ASCII
-    $p = Start-Process -FilePath $installer -WorkingDirectory $base `
-        -RedirectStandardInput $empty -RedirectStandardOutput $log -RedirectStandardError ($log + '.err') -PassThru -NoNewWindow
 
-    if (-not $p.WaitForExit(1800000)) {
-        try { $p.Kill() } catch {}
-        Fail 'NapCat 一体包安装超过 30 分钟没结束' ('看日志：' + $log + "`n多半是卡在下载 QQ（300 MB）。网络差就手动跑一次安装器。")
-    }
-    if ($p.ExitCode -ne 0) {
-        $tail = ''
-        if (Test-Path $log) { $tail = (Get-Content $log -Tail 12 | Out-String) }
-        Fail ('NapCat 安装器返回错误码 ' + $p.ExitCode) ("日志末尾：`n" + $tail)
+    Set-CloseButton $false
+    Write-RunMarker '安装 NapCat 一体包'
+    try {
+        $p = Start-Process -FilePath $installer -WorkingDirectory $base `
+            -RedirectStandardInput $empty -RedirectStandardOutput $log -RedirectStandardError ($log + '.err') -PassThru -NoNewWindow
+
+        $code = Wait-ProcessWithProgress -Process $p -Label '安装 NapCat' -TimeoutSec 1800 -LogPath $log
+        if ($code -eq -2) {
+            Fail 'NapCat 一体包安装超过 30 分钟没动静' ('看日志：' + $log + "`n多半卡在下载 QQ（300 MB）。网络差就手动跑一次安装器，完事再重跑本脚本。")
+        }
+        if ($code -ne 0) {
+            $tail = ''
+            if (Test-Path $log) { $tail = (Get-Content $log -Tail 12 | Out-String) }
+            Fail ('NapCat 安装器返回错误码 ' + $code) ("日志末尾：`n" + $tail)
+        }
+    } finally {
+        Set-CloseButton $true
     }
 
     $installed = @(Get-ChildItem $base -Directory -ErrorAction SilentlyContinue |
@@ -543,10 +971,13 @@ function Find-NapCat {
     if ($NapCatMode -eq 'shell') {
         Warn '按 -NapCatMode shell：下载不带 QQ 的 NapCat（需要客户机器已有 QQ）'
         $zip2 = Join-Path $script:Root 'NapCat.Shell.zip'
-        try { Invoke-WebRequest -Uri 'https://github.com/NapNeko/NapCatQQ/releases/latest/download/NapCat.Shell.zip' -OutFile $zip2 -UseBasicParsing -TimeoutSec 180 }
-        catch {
-            try { Invoke-WebRequest -Uri 'https://ghproxy.net/https://github.com/NapNeko/NapCatQQ/releases/latest/download/NapCat.Shell.zip' -OutFile $zip2 -UseBasicParsing -TimeoutSec 180 }
-            catch { Fail 'NapCat 下载失败（直连和镜像都没通）' ('手动下 NapCat.Shell.zip 解压，再用 -NapCatDir 指过去。') }
+        $shellMirrors = @(
+            [pscustomobject]@{ Name = 'GitHub 直连'; Url = 'https://github.com/NapNeko/NapCatQQ/releases/latest/download/NapCat.Shell.zip' },
+            [pscustomobject]@{ Name = 'ghproxy'; Url = 'https://ghproxy.net/https://github.com/NapNeko/NapCatQQ/releases/latest/download/NapCat.Shell.zip' },
+            [pscustomobject]@{ Name = 'ghfast'; Url = 'https://ghfast.top/https://github.com/NapNeko/NapCatQQ/releases/latest/download/NapCat.Shell.zip' }
+        )
+        if (-not (Get-FileFromMirrors -Mirrors $shellMirrors -OutFile $zip2)) {
+            Fail 'NapCat 下载失败（所有源都没通）' ('手动下 NapCat.Shell.zip 解压，再用 -NapCatDir 指过去。')
         }
         $local = Join-Path $script:Root 'napcat'
         if (Test-Path $local) { Remove-Item $local -Recurse -Force }
@@ -806,8 +1237,8 @@ function Assert-Environment {
     if ($free -lt 3) { Fail ('磁盘剩余空间不足（' + $free + ' GB）') '至少留 3 GB：Python 3.12 + astrbot + NapCat + 日志。' }
     Ok ('磁盘剩余 ' + $free + ' GB')
 
-    try { $null = Invoke-WebRequest -Uri 'https://docs.astrbot.app' -UseBasicParsing -TimeoutSec 10; Ok '可以访问 AstrBot 文档站（安装脚本来源）' }
-    catch { Warn '访问 docs.astrbot.app 有点慢或不通，安装那步可能会失败' }
+    if (-not $SkipNetworkCheck) { Test-NetworkProfile }
+    else { Warn '按 -SkipNetworkCheck 跳过联网预检：下面哪步下载失败，别怪提示不早说' }
 
     if (-not (Test-IsAdmin)) { Warn '不是管理员：QQ 装在 Program Files 时 NapCat 注入可能失败，登不上就用管理员重跑。' }
 }
@@ -971,8 +1402,27 @@ function Invoke-ActionLogs {
 try {
     Say ('=== ' + $script:AppName + ' ===') 'Cyan'
     Say ('时间：' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+    Set-WindowTitle '启动中'
+
+    Initialize-NetClient
+    Enable-CtrlCGuard
 
     if ($Uninstall) { Remove-Deployment; exit 0 }
+
+    # 上次没跑完？先把话说清楚，别让客户对着“装一半”犯迷糊
+    if ($Action -eq 'Deploy' -and -not $Probe -and -not $SelfCheck) {
+        $prev = Get-PreviousRun
+        if ($prev) {
+            Say ''
+            Warn ('检测到上一次部署没走完：卡在「' + $prev.stage + '」，时间 ' + $prev.at)
+            Info '重跑会接着装，已经装好的部分不会重装；想从头来就先删掉安装目录。'
+            if (-not $Quiet) {
+                $ans = Read-Host '继续吗？(Y/n)'
+                if ($ans -and $ans -notmatch '^[Yy]') { Say '已退出，什么都没有改动。'; exit 0 }
+            }
+            Say ''
+        }
+    }
 
     switch ($Action) {
         'Check'  { Invoke-ActionCheck }
@@ -1076,8 +1526,22 @@ try {
     Say '  AstrBot WebUI：http://127.0.0.1:6185'
     Say ('  日志目录：' + $script:LogDir)
     Say ''
+    Clear-RunMarker
+    Set-WindowTitle '部署完成'
     exit 0
 }
 catch {
+    if ($script:InterruptRequested) {
+        Say ''
+        Say '已按你的意思中止。' 'Yellow'
+        Say ('  卡住的阶段：' + $script:CurrentStage)
+        Say ('  已经装好的东西都留着，重跑本脚本会接着装。')
+        Say ('  日志：' + $script:LogFile)
+        exit 130
+    }
     Fail ('未预期的错误：' + $_.Exception.Message) ("这一条不在常见问题里，把日志发给懂行的人看：`n" + $script:LogFile)
+}
+finally {
+    # 无论如何把关闭按钮还回去，别让客户对着关不掉的窗口发呆
+    Set-CloseButton $true
 }
