@@ -2440,6 +2440,16 @@ try {
     Open-Panel 'http://127.0.0.1:6185' 'AstrBot 面板'
     Say ''
     Say ('   AstrBot 登录提醒：用户名填 astrbot，密码填 ' + $panelPw) 'Yellow'
+    # 面板只认浏览器 localStorage 里的令牌，没法从网址带密码进去；
+    # 能做到最省事的是把密码塞进剪贴板，用户按一次 Ctrl+V。
+    if ($panelPw) {
+        try {
+            Set-Clipboard -Value $panelPw
+            Say '   密码已复制到剪贴板 —— 光标放进密码栏，按 Ctrl+V 就行。' 'Green'
+        } catch {
+            Say '   剪贴板不可用，照着上面手动输入。' 'DarkGray'
+        }
+    }
     Say ''
     Say '   接下来：用手机 QQ 给这个机器人发一句话试试（群里要先 @ 它）。' 'White'
     Say '   日常用「启动.cmd / 停止.cmd / 状态.cmd」，不用再跑这个部署脚本。' 'DarkGray'
