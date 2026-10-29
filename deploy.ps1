@@ -1567,8 +1567,17 @@ function Get-Pbkdf2Hash([string]$Password, [int]$Iterations = 600000) {
     return ('pbkdf2_sha256$' + $Iterations + '$' + $saltHex + '$' + $keyHex)
 }
 
+# NapCat 的 WebUI 认 /webui?token=xxx 这种链接，打开就自动填好令牌，不用手敲
+function Get-NapCatLoginUrl([string]$BaseUrl, [string]$Token) {
+    if (-not $BaseUrl) { $BaseUrl = 'http://127.0.0.1:6099' }
+    $BaseUrl = $BaseUrl.TrimEnd('/')
+    if (-not $Token) { return ($BaseUrl + '/webui') }
+    return ($BaseUrl + '/webui?token=' + [Uri]::EscapeDataString($Token))
+}
+
 function Save-PanelCredentials([string]$Path, [string]$Password, [string]$NapCatUrl) {
     try {
+        $napLogin = Get-NapCatLoginUrl $NapCatUrl $Password
         $lines = @(
             'DSH-QQ 一键部署 —— 面板登录信息（照下面填就行）',
             ('生成时间：' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')),
@@ -1578,9 +1587,10 @@ function Save-PanelCredentials([string]$Path, [string]$Password, [string]$NapCat
             '用户名一栏填：astrbot',
             ('密码一栏填：  ' + $Password),
             '',
-            '=== NapCat 面板（只有令牌一栏）===',
-            ('地址：' + $NapCatUrl),
-            ('令牌（token）一栏填：' + $Password),
+            '=== NapCat 面板 ===',
+            '打开这个链接会直接把令牌填好（不用手敲）：',
+            ('  ' + $napLogin),
+            ('  令牌（token）：' + $Password),
             '',
             '（两个都是本机服务；想换密码就重新跑一次部署脚本）'
         )
@@ -2412,6 +2422,7 @@ try {
         if ($webNap.Token) { $panelPw = $webNap.Token }
     }
     $credFile = Join-Path $script:Root '面板密码.txt'
+    $napLoginUrl = Get-NapCatLoginUrl $napUrl $panelPw
     if ($panelPw) { Save-PanelCredentials $credFile $panelPw $napUrl }
 
     Say ''
@@ -2428,15 +2439,15 @@ try {
     Say '   └─────────────────────────────────────────────' 'Cyan'
     Say ''
     Say '   ┌─ 登录 NapCat 面板 ──────────────────────────' 'Cyan'
-    Say ('   │  地址：' + $napUrl)
-    Say ('   │  令牌（token）一栏填：' + $panelPw) 'Yellow'
+    Say ('   │  自动填好令牌的链接：' + $napLoginUrl) 'Yellow'
+    Say ('   │  （令牌本身：' + $panelPw + '）') 'DarkGray'
     Say '   └─────────────────────────────────────────────' 'Cyan'
     Say ''
     if ($panelPw) { Say ('   这些都存了一份：' + $credFile) 'DarkGray' }
     Say ('   日志目录：' + $script:LogDir) 'DarkGray'
     Say ''
     Say '   正在帮你打开两个面板（没弹出就点上面的地址）……' 'DarkGray'
-    if ($webNap) { Open-Panel $napUrl 'NapCat 面板' }
+    if ($webNap) { Open-Panel $napLoginUrl 'NapCat 面板' }
     Open-Panel 'http://127.0.0.1:6185' 'AstrBot 面板'
     Say ''
     Say ('   AstrBot 登录提醒：用户名填 astrbot，密码填 ' + $panelPw) 'Yellow'
