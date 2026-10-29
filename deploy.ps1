@@ -1506,6 +1506,23 @@ function Get-NapCatRunning([string]$NapCatPath) {
         Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($NapCatPath, [StringComparison]::OrdinalIgnoreCase) })
 }
 
+# 让 NapCat 下次启动时自动登录这个号（webui.json 里的 autoLoginAccount）。
+# 目的：扫一次码拿到号之后，重启不必再扫第二次。
+function Set-NapCatAutoLogin([string]$NapCatPath, [string]$QQNumber) {
+    if (-not $QQNumber) { return $false }
+    foreach ($d in @(Get-NapCatConfigDirs $NapCatPath)) {
+        $f = Join-Path $d 'webui.json'
+        if (-not (Test-Path $f)) { continue }
+        try {
+            $j = Read-Json $f
+            Set-Prop $j 'autoLoginAccount' $QQNumber
+            Write-Json $f $j
+            return $true
+        } catch { }
+    }
+    return $false
+}
+
 function Restart-NapCat([string]$NapCatPath) {
     # 杀干净再拉起来。之前只 Stop-Process，偶发杀不掉就变成两个实例抢 QQ，
     # 现象是“一直连不上”，很难查。
@@ -2182,9 +2199,16 @@ try {
     }
 
     # 机器人小号只有扫完码才知道，这里给的是"预期号"，可以留空
-    if (-not $QQ) { $QQ = Read-Host '你打算用哪个小号当机器人？（可留空，扫完自动识别）' }
-    if ($QQ -and $QQ -notmatch '^\d{5,12}$') { Fail ('QQ 号格式不对：' + $QQ) '只填数字，5~12 位；或者直接回车留空。' }
+    # 机器人小号不用问：扫完码脚本自己就能认出来。
+    # -QQ 只是"我已经知道是哪个号"时的加速提示（给了就能省掉一次重启/扫码）。
+    if ($QQ -and $QQ -notmatch '^\d{5,12}$') { Fail ('-QQ 格式不对：' + $QQ) '只填数字，5~12 位；不填也行，扫码后自动识别。' }
     $hasQqHint = [bool]$QQ
+
+    # 该问的是"主人号"：当管理员、收测试消息都要它
+    if (-not $OwnerQQ -and -not $Quiet) {
+        $OwnerQQ = Read-Host '你自己的 QQ 号（当管理员、接收测试消息；可回车跳过）'
+    }
+    if ($OwnerQQ -and $OwnerQQ -notmatch '^\d{5,12}$') { Warn ('主人号格式看着不对：' + $OwnerQQ + '，先不管了') ; $OwnerQQ = '' }
 
     if (-not $ApiKey) { $ApiKey = Read-Host '请输入模型 API Key（回车跳过，之后在 WebUI 里填）' }
 
@@ -2233,28 +2257,42 @@ try {
         if (-not $hasQqHint) {
             $QQ = $actualQQ
             Say ''
-            Info ('认出机器人的号是 ' + $QQ)
-            Info '现在按这个号写配置；写完要重启一次 NapCat，需要【再扫一次码】（最后一次）'
+            Ok ('扫码成功，机器人号是 ' + $QQ)
             Set-NapCatConfig $napRoot $QQ $ob.Port $ob.Token
+            if (Set-NapCatAutoLogin $napRoot $QQ) {
+                Info '已记下这个号，重启后试着自动登录（不灵会让你再扫一次）'
+            }
             if (-not (Restart-NapCat $napRoot)) {
                 Fail 'NapCat 重启失败，没法继续' '手动结束所有 NapCatWinBootMain.exe 和 QQ.exe，再重跑本脚本。'
             }
-            if (-not (Start-NapCat $napRoot $QQ $ob.Port -SkipPrompt)) {
-                Fail '第二次扫码没有成功' ('重跑本脚本，这次直接用 ' + $QQ + ' 扫。')
+            # 先给自动登录一个机会；不行再让客户补扫一次
+            if (-not (Wait-NapCatConnected $ob.Port 45)) {
+                Info '这台机器没能自动登录，需要再扫一次码（最后一次）'
+                if (-not (Start-NapCat $napRoot $QQ $ob.Port -SkipPrompt)) {
+                    Fail '第二次扫码没有成功' ('重跑本脚本，这次直接用 ' + $QQ + ' 扫。')
+                }
             }
         } elseif ($actualQQ -ne $QQ) {
             Say ''
             Warn ('你扫的号是 ' + $actualQQ + '，预期的是 ' + $QQ)
             Info 'NapCat 按 QQ 号分文件存配置，写错号等于没写；下面改按实际扫的号重写'
-            Info '写完要重启一次 NapCat（它不会自动登录），所以需要【再扫一次码】，这是最后一次'
             $QQ = $actualQQ
             Set-NapCatConfig $napRoot $QQ $ob.Port $ob.Token
+            if (Set-NapCatAutoLogin $napRoot $QQ) {
+                Info '已记下这个号，重启后试着自动登录（不灵会让你再扫一次）'
+            }
             if (-not (Restart-NapCat $napRoot)) {
                 Fail 'NapCat 重启失败，没法继续' '手动结束所有 NapCatWinBootMain.exe 和 QQ.exe，再重跑本脚本。'
             }
-            if (-not (Start-NapCat $napRoot $QQ $ob.Port -SkipPrompt)) {
-                Fail '第二次扫码没有成功' ('重跑本脚本，这次直接用 ' + $QQ + ' 扫。')
+            if (-not (Wait-NapCatConnected $ob.Port 45)) {
+                Info '这台机器没能自动登录，需要再扫一次码（最后一次）'
+                if (-not (Start-NapCat $napRoot $QQ $ob.Port -SkipPrompt)) {
+                    Fail '第二次扫码没有成功' ('重跑本脚本，这次直接用 ' + $QQ + ' 扫。')
+                }
             }
+        } else {
+            # 扫的就是预期号：配置早就写好了，登录即连
+            [void](Set-NapCatAutoLogin $napRoot $QQ)
         }
 
         if (-not (Wait-NapCatConnected $ob.Port 90)) {
