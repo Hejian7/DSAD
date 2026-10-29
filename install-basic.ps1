@@ -76,6 +76,8 @@ Say '   开始部署……' 'Green'
 Say ''
 
 $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $deploy + '"'))
+# 告诉部署脚本"安装根在上一层"：不然它会按自己所在的 _install\ 再套一层 ds-as-nap\
+$argList += @('-InstallRoot', ('"' + (Join-Path $PSScriptRoot 'ds-as-nap') + '"'))
 if ($QQ) { $argList += @('-QQ', $QQ) }
 if ($OwnerQQ) { $argList += @('-OwnerQQ', $OwnerQQ) }
 if ($ApiKey) { $argList += @('-ApiKey', $ApiKey) }
