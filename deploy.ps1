@@ -1507,22 +1507,38 @@ function Get-NapCatRunning([string]$NapCatPath) {
 }
 
 function Restart-NapCat([string]$NapCatPath) {
-    $running = Get-NapCatRunning $NapCatPath
-    if ($running.Count -gt 0) {
-        Info ('重启 NapCat 让新配置生效（停掉 PID ' + (($running | ForEach-Object { $_.ProcessId }) -join ',') + '）')
-        foreach ($p in $running) {
-            foreach ($k in @(Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -eq $p.ProcessId })) {
-                Stop-Process -Id $k.ProcessId -Force -ErrorAction SilentlyContinue
-            }
-            Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+    # 杀干净再拉起来。之前只 Stop-Process，偶发杀不掉就变成两个实例抢 QQ，
+    # 现象是“一直连不上”，很难查。
+    for ($round = 1; $round -le 3; $round++) {
+        $running = @(Get-NapCatRunning $NapCatPath)
+        if ($running.Count -eq 0) { break }
+        if ($round -eq 1) {
+            Info ('重启 NapCat 让新配置生效（停掉 PID ' + (($running | ForEach-Object { $_.ProcessId }) -join ',') + '）')
         }
-        Start-Sleep -Seconds 4
+        foreach ($p in $running) {
+            cmd /c ('taskkill /F /T /PID ' + $p.ProcessId) 2>&1 | Out-Null
+        }
+        Start-Sleep -Seconds 2
     }
+
+    $left = @(Get-NapCatRunning $NapCatPath)
+    if ($left.Count -gt 0) {
+        Warn ('还有 ' + $left.Count + ' 个 NapCat 进程杀不掉（PID ' + (($left | ForEach-Object { $_.ProcessId }) -join ',') + '）')
+        Warn '请手动在任务管理器里结束 NapCatWinBootMain.exe / QQ.exe，再重跑本脚本。'
+        return $false
+    }
+
     # 停了就要拉起来，不然配置写完了也没人读
     $boot = Join-Path $NapCatPath 'NapCatWinBootMain.exe'
-    if (Test-Path $boot) {
-        try { Start-Process -FilePath $boot -WorkingDirectory $NapCatPath | Out-Null } catch { }
+    if (-not (Test-Path $boot)) { return $false }
+    try {
+        Start-Process -FilePath $boot -WorkingDirectory $NapCatPath | Out-Null
+    } catch {
+        Warn ('NapCat 拉不起来：' + $_.Exception.Message)
+        return $false
     }
+    Start-Sleep -Seconds 3
+    return $true
 }
 
 function Test-NapCatConnected([int]$Port) {
@@ -1706,7 +1722,7 @@ function Wait-NapCatConnected([int]$Port, [int]$TimeoutSec = 120) {
 }
 
 # 启动 NapCat → 扫码 → 返回实际登录的 QQ 号（这才是准的，不是参数里那个）
-function Start-NapCat([string]$NapCatPath, [string]$ExpectQQ, [int]$Port) {
+function Start-NapCat([string]$NapCatPath, [string]$ExpectQQ, [int]$Port, [switch]$SkipPrompt) {
     Step 5 '启动 NapCat，用小号扫码登录'
 
     $boot = Join-Path $NapCatPath 'NapCatWinBootMain.exe'
@@ -1720,13 +1736,14 @@ function Start-NapCat([string]$NapCatPath, [string]$ExpectQQ, [int]$Port) {
     } else {
         Say ''
         Say '  ------------------------------------------------------------' 'Cyan'
-        Say '   下一步要扫码登录，请准备好【机器人小号】' 'Cyan'
+        if ($SkipPrompt) { Say '   再扫一次码（配置换成了新号，需要重新登录）' 'Cyan' }
+        else { Say '   下一步要扫码登录，请准备好【机器人小号】' 'Cyan' }
         Say '  ------------------------------------------------------------' 'Cyan'
         Say '   · 这个号以后就是替你回消息的机器人，别用你自己的常用号'
-        if ($ExpectQQ) { Say ('   · 脚本里填的是 ' + $ExpectQQ + '；扫成别的号也行，脚本会以你实际扫的为准') 'Yellow' }
+        if ($ExpectQQ) { Say ('   · 请用 ' + $ExpectQQ + ' 扫；扫成别的号也行，脚本会以你实际扫的为准') 'Yellow' }
         Say '   · 扫完我会自动检测、把二维码窗口关掉，然后继续配置'
         Say ''
-        if (-not $Quiet) {
+        if (-not $Quiet -and -not $SkipPrompt) {
             $ans = Read-Host '   准备好了按回车开始（输入 n 取消）'
             if ($ans -match '^[nN]') { Fail '已取消，什么都没有改动' '想装的时候重新跑一次就行。' }
         }
@@ -1945,14 +1962,25 @@ function Get-AnyNapCatRoot {
 }
 
 function Stop-AllNapCat {
+    # 用 taskkill /T 连子进程（QQ）一起收拾；Stop-Process 偶尔杀不干净，
+    # 结果就是两个 NapCat 实例抢同一个 QQ，表现成“一直连不上”。
     $procs = @(Get-CimInstance Win32_Process -Filter "Name='NapCatWinBootMain.exe'" -ErrorAction SilentlyContinue)
+    if ($procs.Count -eq 0) { return $false }
+
     foreach ($p in $procs) {
-        foreach ($k in @(Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -eq $p.ProcessId })) {
-            Stop-Process -Id $k.ProcessId -Force -ErrorAction SilentlyContinue
-        }
-        Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+        cmd /c ('taskkill /F /T /PID ' + $p.ProcessId) 2>&1 | Out-Null
     }
-    return ($procs.Count -gt 0)
+    Start-Sleep -Seconds 2
+
+    $left = @(Get-CimInstance Win32_Process -Filter "Name='NapCatWinBootMain.exe'" -ErrorAction SilentlyContinue)
+    if ($left.Count -gt 0) {
+        foreach ($p in $left) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
+        Start-Sleep -Seconds 1
+    }
+
+    # 还有 NapCat 目录下残留的 QQ.exe，也一并清掉（不动你自己常用的 QQ）
+    Start-Sleep -Milliseconds 500
+    return $true
 }
 
 function Invoke-ActionCheck {
@@ -1999,10 +2027,10 @@ function Invoke-ActionStart {
 
     $nap = Get-AnyNapCatRoot
     if ($nap) {
-        if (@(Get-NapCatRunning $nap).Count -eq 0) {
-            Start-Process -FilePath (Join-Path $nap 'NapCatWinBootMain.exe') -WorkingDirectory $nap | Out-Null
-            Ok 'NapCat 已拉起'
-        } else { Ok 'NapCat 本来就在跑' }
+        # 启动前先清场：避免上一次没退干净的 NapCat 和这次抢同一个 QQ
+        if (Stop-AllNapCat) { Info '已先关掉旧的 NapCat 进程' }
+        Start-Process -FilePath (Join-Path $nap 'NapCatWinBootMain.exe') -WorkingDirectory $nap | Out-Null
+        Ok 'NapCat 已拉起'
     } else { Warn '没找到 NapCat：先跑一次「一键部署.cmd」' }
 
     Invoke-SelfCheck $port $ab | Out-Null
@@ -2182,26 +2210,38 @@ try {
     }
     Ok ('AstrBot 服务端就绪：' + $ob.Port)
 
-    # 5) 启动 NapCat 并扫码 —— 这一步还不知道客户会扫哪个号，所以先不写配置
+    # 5) 先按 -QQ 写配置：扫的就是这个号时，登完直接连上，只扫一次码
     if (-not $KeepNapCatRunning) {
+        Step '5.0' '先关掉正在运行的 NapCat'
+        if (Stop-AllNapCat) { Ok '已关掉旧进程（多开抢 QQ 是“连不上”的头号原因）' }
+        else { Info '本来就没有 NapCat 在跑' }
+
+        Set-NapCatConfig $napRoot $QQ $ob.Port $ob.Token
+
         $actualQQ = Start-NapCat $napRoot $QQ $ob.Port
         if ($actualQQ -and ($actualQQ -ne $QQ)) {
             Say ''
             Warn ('你扫的号是 ' + $actualQQ + '，脚本里填的是 ' + $QQ)
-            Info ('以你实际扫的号为准，下面都按 ' + $actualQQ + ' 配；想换成 ' + $QQ + ' 就重跑并换号扫')
+            Info ('NapCat 按 QQ 号分文件存配置，写错号等于没写；下面改按 ' + $actualQQ + ' 重写')
+            Info '写完要重启一次 NapCat（它不会自动登录），所以需要【再扫一次码】，这是最后一次'
             $QQ = $actualQQ
+            Set-NapCatConfig $napRoot $QQ $ob.Port $ob.Token
+            if (-not (Restart-NapCat $napRoot)) {
+                Fail 'NapCat 重启失败，没法继续' '手动结束所有 NapCatWinBootMain.exe 和 QQ.exe，再重跑本脚本。'
+            }
+            $again = Start-NapCat $napRoot $QQ $ob.Port -SkipPrompt
+            if (-not $again) {
+                Fail '第二次扫码没有成功' '重跑本脚本，这次请直接用 ' + $QQ + ' 扫。'
+            }
         }
 
-        # 6) 拿到真实号之后再写配置：NapCat 按 QQ 号分文件存配置，写错号等于没写
-        Set-NapCatConfig $napRoot $QQ $ob.Port $ob.Token
-        Info '重启 NapCat 让配置生效（已登录，不用再扫码）'
-        Restart-NapCat $napRoot
-        if (-not (Wait-NapCatConnected $ob.Port 120)) {
-            Fail 'NapCat 重启后没有连上 AstrBot' @"
-配置写进去了（记在 QQ $QQ 名下），但它没连上来。可能原因：
-  1) 重启后没有自动登录（需要再扫一次码）：重跑本脚本
-  2) AstrBot 的 token 和 NapCat 里不一致：重跑一次会自动对齐
-  3) NapCat 面板里看看连接状态：http://127.0.0.1:6099
+        if (-not (Wait-NapCatConnected $ob.Port 90)) {
+            Fail 'NapCat 没有连上 AstrBot' @"
+二维码已经扫过了，但它没连上来。按顺序看：
+  1) NapCat 面板里的连接状态：http://127.0.0.1:6099
+  2) AstrBot 的 token 和 NapCat 里的是否一致（重跑一次会自动对齐）
+  3) 端口被占就换：-OneBotPort 8123
+  4) 日志目录里有 astrbot.out.log，看看适配器有没有报错
 "@
         }
         Ok 'NapCat 已连上 AstrBot（反向 WS 通）'
