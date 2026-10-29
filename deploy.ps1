@@ -544,6 +544,14 @@ function Write-Json([string]$Path, $Object) {
     [IO.File]::WriteAllText($Path, $json + "`n", $utf8)
 }
 
+# 给从 JSON 读回来的对象设字段。PS 5.1 里对 PSCustomObject 直接 `$o.新字段 = x`
+# 会抛 "The property 'x' cannot be found on this object"——老配置缺字段时必崩。
+# 统一走 Add-Member -Force，缺了就补、有就覆盖。
+function Set-Prop($Object, [string]$Name, $Value) {
+    if ($null -eq $Object) { return }
+    $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value -Force
+}
+
 function Test-PortListen([int]$Port) {
     return [bool](Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
 }
@@ -978,14 +986,14 @@ function Set-AstrBotConfig($Target, [string]$QQNumber, [string]$Key, [switch]$Gr
         $changed = $true
         Ok ('没有 OneBot 平台，已新建：端口 ' + $OneBotPort)
     } else {
-        if ($plat.enable -ne $true) { $plat.enable = $true; $changed = $true }
-        if (-not $plat.ws_reverse_port) { $plat.ws_reverse_port = $OneBotPort; $changed = $true }
+        if ($plat.enable -ne $true) { Set-Prop $plat 'enable' $true; $changed = $true }
+        if (-not $plat.ws_reverse_port) { Set-Prop $plat 'ws_reverse_port' $OneBotPort; $changed = $true }
         if (-not $plat.ws_reverse_token) {
-            $plat.ws_reverse_token = (-join ((48..57) + (65..90) + (97..122) | Get-Random -Count 32 | ForEach-Object { [char]$_ }))
+            Set-Prop $plat 'ws_reverse_token' (-join ((48..57) + (65..90) + (97..122) | Get-Random -Count 32 | ForEach-Object { [char]$_ }))
             $changed = $true
         }
     }
-    $cfg.platform = $platforms
+    Set-Prop $cfg 'platform' $platforms
 
     $obPort = [int]$plat.ws_reverse_port
     $obToken = [string]$plat.ws_reverse_token
@@ -1003,7 +1011,9 @@ function Set-AstrBotConfig($Target, [string]$QQNumber, [string]$Key, [switch]$Gr
             $cfg.provider_sources = @($cfg.provider_sources) + $src
             $changed = $true
         } else {
-            $src.key = @($Key); $src.enable = $true; $changed = $true
+            Set-Prop $src 'key' @($Key)
+            Set-Prop $src 'enable' $true
+            $changed = $true
         }
         if (-not $cfg.provider) { $cfg | Add-Member -NotePropertyName provider -NotePropertyValue @() -Force }
         $prov = @($cfg.provider) | Where-Object { $_.id -eq ('deepseek/' + $Model) } | Select-Object -First 1
@@ -1027,17 +1037,17 @@ function Set-AstrBotConfig($Target, [string]$QQNumber, [string]$Key, [switch]$Gr
     if ($GroupMode) {
         if (-not $cfg.platform_settings) { $cfg | Add-Member -NotePropertyName platform_settings -NotePropertyValue ([pscustomobject]@{}) -Force }
         $ps = $cfg.platform_settings
-        $ps.enable_id_white_list = $true
+        Set-Prop $ps 'enable_id_white_list' $true
         $wl = @(@($ps.id_whitelist) | Where-Object { $_ -ne $null -and "$_" -ne '' })
         if ($Gid -ne '' -and ($wl -notcontains $Gid)) { $wl += $Gid }
-        if ($wl.Count -gt 0) { $ps.id_whitelist = $wl }
-        if (-not $ps.rate_limit) { $ps.rate_limit = [pscustomobject]@{} }
-        $ps.rate_limit.time = 60
-        $ps.rate_limit.count = 12
-        $ps.rate_limit.strategy = 'stall'
-        $ps.friend_message_needs_wake_prefix = $false
-        $ps.ignore_bot_self_message = $true
-        $cfg.wake_prefix = @($Wake)
+        if ($wl.Count -gt 0) { Set-Prop $ps 'id_whitelist' $wl }
+        if (-not $ps.rate_limit) { Set-Prop $ps 'rate_limit' ([pscustomobject]@{}) }
+        Set-Prop $ps.rate_limit 'time' 60
+        Set-Prop $ps.rate_limit 'count' 12
+        Set-Prop $ps.rate_limit 'strategy' 'stall'
+        Set-Prop $ps 'friend_message_needs_wake_prefix' $false
+        Set-Prop $ps 'ignore_bot_self_message' $true
+        Set-Prop $cfg 'wake_prefix' @($Wake)
         $changed = $true
         Ok ('群聊预设：唤醒词「' + $Wake + '」')
         if ($Gid -ne '') { Ok ('群白名单：' + $Gid) } else { Info '没给群号：白名单留空，等你在群里用 /sid 拿到群号后再加' }
@@ -1333,17 +1343,27 @@ function Set-NapCatConfig([string]$NapCatPath, [string]$QQNumber, [int]$Port, [s
 
     $clients = @($store.network.websocketClients)
     $mine = $clients | Where-Object { $_.name -eq 'dsh-deploy' } | Select-Object -First 1
-    if (-not $mine) { $mine = $clients | Where-Object { $_.url -and $_.url -match (':' + $Port + '/') } | Select-Object -First 1 }
-    if (-not $mine) { $mine = [pscustomobject]@{ name = 'dsh-deploy' }; $clients += $mine }
+    if (-not $mine) { $mine = $clients | Where-Object { $_.url -and ($_.url -match (':' + $Port + '(/|$)')) } | Select-Object -First 1 }
+    if (-not $mine) {
+        # 一次建全，不要建个只有 name 的空壳再去补字段
+        $mine = [pscustomobject]@{
+            name = 'dsh-deploy'; enable = $true; url = 'ws://127.0.0.1:' + $Port + '/ws'
+            token = $Token; reportSelfMessage = $false; messagePostFormat = 'array'
+            reconnectInterval = 30000; heartInterval = 30000; verifyCertificate = $true
+        }
+        $clients += $mine
+    }
 
-    $mine.enable = $true
-    $mine.url = 'ws://127.0.0.1:' + $Port + '/ws'
-    $mine.token = $Token
-    $mine.reportSelfMessage = $false
-    $mine.messagePostFormat = 'array'
-    $mine.reconnectInterval = 30000
-    $mine.heartInterval = 30000
-    $mine.verifyCertificate = $true
+    # 一律 Add-Member：老 NapCat 配置里的客户端常常没有 enable/verifyCertificate 这些键，
+    # 直接 $mine.enable = $true 会抛 "The property 'enable' cannot be found"。
+    Set-Prop $mine 'enable' $true
+    Set-Prop $mine 'url' ('ws://127.0.0.1:' + $Port + '/ws')
+    Set-Prop $mine 'token' $Token
+    Set-Prop $mine 'reportSelfMessage' $false
+    Set-Prop $mine 'messagePostFormat' 'array'
+    Set-Prop $mine 'reconnectInterval' 30000
+    Set-Prop $mine 'heartInterval' 30000
+    Set-Prop $mine 'verifyCertificate' $true
     $store.network.websocketClients = $clients
     Write-Json $target $store
 
