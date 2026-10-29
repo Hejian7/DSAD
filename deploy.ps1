@@ -1592,7 +1592,6 @@ function Show-QrCode([string]$Path, [string]$ExpectQQ) {
     Say ''
     Say '   第 1 步：打开手机 QQ → 右上角「+」→ 扫一扫'
     Say '   第 2 步：用你准备当机器人的【小号】扫，别用平时自己聊天的号'
-    if ($ExpectQQ) { Say ('            （脚本里填的号是 ' + $ExpectQQ + '，扫的和它不一样也没关系）') 'Yellow' }
     Say '   第 3 步：扫完就放那儿，我会自动检测、关掉二维码、继续往下配'
     Say ''
     Say ('   二维码文件：' + $Path) 'DarkGray'
@@ -1739,9 +1738,9 @@ function Start-NapCat([string]$NapCatPath, [string]$ExpectQQ, [int]$Port, [switc
         if ($SkipPrompt) { Say '   再扫一次码（配置换成了新号，需要重新登录）' 'Cyan' }
         else { Say '   下一步要扫码登录，请准备好【机器人小号】' 'Cyan' }
         Say '  ------------------------------------------------------------' 'Cyan'
-        Say '   · 这个号以后就是替你回消息的机器人，别用你自己的常用号'
-        if ($ExpectQQ) { Say ('   · 请用 ' + $ExpectQQ + ' 扫；扫成别的号也行，脚本会以你实际扫的为准') 'Yellow' }
-        Say '   · 扫完我会自动检测、把二维码窗口关掉，然后继续配置'
+        Say '   · 用你准备当机器人的【小号】扫，别用平时自己聊天的号'
+        Say '   · 脚本不预设是哪个号，扫完自动认；认出来之后会告诉你'
+        Say '   · 扫完我会关掉二维码窗口，然后继续往下配置'
         Say ''
         if (-not $Quiet -and -not $SkipPrompt) {
             $ans = Read-Host '   准备好了按回车开始（输入 n 取消）'
@@ -2182,8 +2181,11 @@ try {
         exit 0
     }
 
-    if (-not $QQ) { $QQ = Read-Host '请输入机器人 QQ 号（纯数字）' }
-    if ($QQ -notmatch '^\d{5,12}$') { Fail ('QQ 号格式不对：' + $QQ) '只填数字，5~12 位。' }
+    # 机器人小号只有扫完码才知道，这里给的是"预期号"，可以留空
+    if (-not $QQ) { $QQ = Read-Host '你打算用哪个小号当机器人？（可留空，扫完自动识别）' }
+    if ($QQ -and $QQ -notmatch '^\d{5,12}$') { Fail ('QQ 号格式不对：' + $QQ) '只填数字，5~12 位；或者直接回车留空。' }
+    $hasQqHint = [bool]$QQ
+
     if (-not $ApiKey) { $ApiKey = Read-Host '请输入模型 API Key（回车跳过，之后在 WebUI 里填）' }
 
     if (-not (Test-Path $ab.Config)) {
@@ -2196,7 +2198,10 @@ try {
         Ok '配置已生成'
     }
 
-    $ob = Set-AstrBotConfig $ab $QQ $ApiKey -GroupMode:$Group -Wake $WakeWord -Gid $GroupId
+    # 管理员给「主人号」：AstrBot 的管理指令应该由你来使，不是机器人自己
+    $adminQQ = $OwnerQQ
+    if (-not $adminQQ) { $adminQQ = $QQ }
+    $ob = Set-AstrBotConfig $ab $adminQQ $ApiKey -GroupMode:$Group -Wake $WakeWord -Gid $GroupId
 
     Info '重启 AstrBot 让配置生效'
     if (Stop-AstrBot) { Start-Sleep -Seconds 3 }
@@ -2210,28 +2215,45 @@ try {
     }
     Ok ('AstrBot 服务端就绪：' + $ob.Port)
 
-    # 5) 先按 -QQ 写配置：扫的就是这个号时，登完直接连上，只扫一次码
+    # 5) 扫码。给了预期号就先写配置（扫对了只扫一次）；没给就先扫、扫完再配
     if (-not $KeepNapCatRunning) {
         Step '5.0' '先关掉正在运行的 NapCat'
         if (Stop-AllNapCat) { Ok '已关掉旧进程（多开抢 QQ 是“连不上”的头号原因）' }
         else { Info '本来就没有 NapCat 在跑' }
 
-        Set-NapCatConfig $napRoot $QQ $ob.Port $ob.Token
+        if ($hasQqHint) { Set-NapCatConfig $napRoot $QQ $ob.Port $ob.Token }
+        else { Info '没给机器人号：先扫码认出是哪个号，再写配置' }
+        if (-not (Restart-NapCat $napRoot)) {
+            Fail 'NapCat 重启失败，没法继续' '手动结束所有 NapCatWinBootMain.exe 和 QQ.exe，再重跑本脚本。'
+        }
 
         $actualQQ = Start-NapCat $napRoot $QQ $ob.Port
-        if ($actualQQ -and ($actualQQ -ne $QQ)) {
+        if (-not $actualQQ) { Fail '没有检测到登录成功' '重跑一次；扫码时别关 QQ 窗口。' }
+
+        if (-not $hasQqHint) {
+            $QQ = $actualQQ
             Say ''
-            Warn ('你扫的号是 ' + $actualQQ + '，脚本里填的是 ' + $QQ)
-            Info ('NapCat 按 QQ 号分文件存配置，写错号等于没写；下面改按 ' + $actualQQ + ' 重写')
+            Info ('认出机器人的号是 ' + $QQ)
+            Info '现在按这个号写配置；写完要重启一次 NapCat，需要【再扫一次码】（最后一次）'
+            Set-NapCatConfig $napRoot $QQ $ob.Port $ob.Token
+            if (-not (Restart-NapCat $napRoot)) {
+                Fail 'NapCat 重启失败，没法继续' '手动结束所有 NapCatWinBootMain.exe 和 QQ.exe，再重跑本脚本。'
+            }
+            if (-not (Start-NapCat $napRoot $QQ $ob.Port -SkipPrompt)) {
+                Fail '第二次扫码没有成功' ('重跑本脚本，这次直接用 ' + $QQ + ' 扫。')
+            }
+        } elseif ($actualQQ -ne $QQ) {
+            Say ''
+            Warn ('你扫的号是 ' + $actualQQ + '，预期的是 ' + $QQ)
+            Info 'NapCat 按 QQ 号分文件存配置，写错号等于没写；下面改按实际扫的号重写'
             Info '写完要重启一次 NapCat（它不会自动登录），所以需要【再扫一次码】，这是最后一次'
             $QQ = $actualQQ
             Set-NapCatConfig $napRoot $QQ $ob.Port $ob.Token
             if (-not (Restart-NapCat $napRoot)) {
                 Fail 'NapCat 重启失败，没法继续' '手动结束所有 NapCatWinBootMain.exe 和 QQ.exe，再重跑本脚本。'
             }
-            $again = Start-NapCat $napRoot $QQ $ob.Port -SkipPrompt
-            if (-not $again) {
-                Fail '第二次扫码没有成功' '重跑本脚本，这次请直接用 ' + $QQ + ' 扫。'
+            if (-not (Start-NapCat $napRoot $QQ $ob.Port -SkipPrompt)) {
+                Fail '第二次扫码没有成功' ('重跑本脚本，这次直接用 ' + $QQ + ' 扫。')
             }
         }
 

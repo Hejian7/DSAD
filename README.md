@@ -53,6 +53,11 @@ README-ubuntu.md      Ubuntu 使用说明（2C2G 开 swap、headless 登录方�
 docs/                 设计与规划文档（架构、待办）
 ```
 
+> **改 `deploy.ps1` 的人注意：这个文件必须带 UTF-8 BOM。**
+> 目标运行时是 Windows PowerShell 5.1，没有 BOM 它会按系统 ANSI（中文机器上是 GBK）读，
+> 中文全部乱码，甚至直接报一串 `Unexpected token` 语法错误。
+> 用编辑器另存为「UTF-8 带 BOM」；批量替换/脚本改写过之后，务必检查文件开头是不是 `EF BB BF`。
+
 ---
 
 ## 几个前提
