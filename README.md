@@ -24,7 +24,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy.ps1 -QQ 123456789 -
 ```bash
 git clone https://github.com/Hejian7/DSAD.git
 cd DSAD
-sudo bash deploy.sh --qq 123456789 --api-key sk-xxxx
+sudo bash linuxdsq/deploy.sh --qq 123456789 --api-key sk-xxxx
 ```
 
 装完扫一次二维码就完事；之后 NapCat 会留快速登录凭证，重启不用再扫。
@@ -47,9 +47,10 @@ sudo bash deploy.sh --qq 123456789 --api-key sk-xxxx
 
 ```
 deploy.ps1            Windows 部署脚本
-deploy.sh             Ubuntu / Debian 部署脚本
+linuxdsq/deploy.sh    Ubuntu / Debian 部署脚本
 README-windows.md     Windows 使用说明
 README-ubuntu.md      Ubuntu 使用说明（2C2G 开 swap、headless 登录方式）
+docs/                 设计与规划文档（架构、待办）
 ```
 
 ---
