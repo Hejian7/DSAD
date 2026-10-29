@@ -53,7 +53,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'
+# 进度条用 Write-Progress 原地重绘（不再用 \r 覆写，那样中文会重影）
+$ProgressPreference = 'Continue'
 
 # ── 常量 ───────────────────────────────────────────────────────────────────
 $script:AppName = 'DSH-QQ 一键部署'
@@ -244,7 +245,7 @@ function Get-LocalInventory {
 
     $inv.Python312 = Get-Python312Path
     if ($inv.Python312) { Ok ('Python 3.12：已装 ' + $inv.Python312) }
-    else { Info 'Python 3.12：没有 —— 需要时装官方包（约 27 MB）' }
+    else { Info 'Python 3.12：没有 —— 需要时下可嵌入版（约 11 MB，不写注册表）' }
 
     $ab = Resolve-AstrBotExisting
     $inv.AstrBot = $ab
@@ -386,17 +387,24 @@ function Get-FileWithProgress {
                         $out.Write($buf, 0, $n)
                         $done += $n
                         $now = Get-Date
-                        if (($now - $lastPaint).TotalSeconds -ge 2) {
+                        if (($now - $lastPaint).TotalSeconds -ge 1) {
                             $lastPaint = $now
                             $mb = $done / 1MB
+                            $spd = 0.0
+                            if ($sw.Elapsed.TotalSeconds -gt 0.5) { $spd = ($done / 1MB) / $sw.Elapsed.TotalSeconds }
                             if ($total -gt 0) {
                                 $pct = [int](100 * $done / $total)
-                                $spd = 0.0
-                                if ($sw.Elapsed.TotalSeconds -gt 0.5) { $spd = ($done / 1MB) / $sw.Elapsed.TotalSeconds }
-                                if (-not $Quiet) { Write-Host ('    · {0}  {1:N1}/{2:N1} MB  {3}%  {4:N1} MB/s' -f $Label, $mb, ($total / 1MB), $pct, $spd) -ForegroundColor DarkGray }
+                                if (-not $Quiet) {
+                                    Write-Progress -Id 10 -Activity ('下载 ' + $Label) `
+                                        -Status ("{0:N1} / {1:N1} MB    {2}%    {3:N1} MB/s" -f $mb, ($total / 1MB), $pct, $spd) `
+                                        -PercentComplete $pct
+                                }
                                 Set-WindowTitle ('下载 ' + $Label + ' ' + $pct + '%')
                             } else {
-                                if (-not $Quiet) { Write-Host ('    · {0}  {1:N1} MB' -f $Label, $mb) -ForegroundColor DarkGray }
+                                if (-not $Quiet) {
+                                    Write-Progress -Id 10 -Activity ('下载 ' + $Label) `
+                                        -Status ("已下载 {0:N1} MB    {1:N1} MB/s" -f $mb, $spd) -PercentComplete -1
+                                }
                                 Set-WindowTitle ('下载 ' + $Label + ' ' + ('{0:N1}' -f $mb) + ' MB')
                             }
                         }
@@ -414,8 +422,10 @@ function Get-FileWithProgress {
             }
             if (Test-Path $OutFile) { Remove-Item $OutFile -Force -ErrorAction SilentlyContinue }
             Move-Item $tmp $OutFile -Force
+            Write-Progress -Id 10 -Activity ('下载 ' + $Label) -Completed
             return $true
         } catch {
+            Write-Progress -Id 10 -Activity ('下载 ' + $Label) -Completed
             if ($script:InterruptRequested) { throw }
             if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
             # 代理最坑：注册表里配着、进程早死了。显式挂一个死代理会让所有请求全灭。
@@ -501,17 +511,48 @@ function Wait-ProcessWithProgress {
         }
         if ($line.Length -gt 60) { $line = $line.Substring(0, 60) }
 
-        # 每 5 秒（或日志出了新行）打一行普通文本，绝不用 \r 覆写
-        if (($elapsed - $lastPrint) -ge 5 -or ($line -and $line -ne $lastShown)) {
+        # 原地重绘：不刷屏，也不会把中文画坏
+        if (($elapsed - $lastPrint) -ge 1 -or ($line -and $line -ne $lastShown)) {
             $lastPrint = $elapsed
             $lastShown = $line
             if (-not $Quiet) {
-                if ($line) { Write-Host ('    · {0}  [{1}]  {2}' -f $Label, $t, $line) -ForegroundColor DarkGray }
-                else { Write-Host ('    · {0}  [{1}]  正在跑…' -f $Label, $t) -ForegroundColor DarkGray }
+                # uv 会先打印 "Resolved N packages"，之后每个包一行
+                # Downloading/Prepared/Built/Installed —— 两个数凑起来就是真进度
+                $done = 0
+                $totalPkgs = 0
+                if ($LogPath) {
+                    foreach ($f in @(($LogPath + '.err'), $LogPath)) {
+                        if (-not (Test-Path $f)) { continue }
+                        try {
+                            $txt = [System.IO.File]::ReadAllText($f)
+                            $done += ([regex]::Matches($txt, '(?m)^\s*(Downloading|Prepared|Built|Installed)\s')).Count
+                            if ($totalPkgs -eq 0) {
+                                $mm = [regex]::Match($txt, 'Resolved (\d+) packages')
+                                if ($mm.Success) { $totalPkgs = [int]$mm.Groups[1].Value }
+                            }
+                        } catch { }
+                    }
+                }
+                $parts = @('已用 ' + $t)
+                if ($totalPkgs -gt 0) {
+                    $parts += ('{0}/{1} 个包' -f [Math]::Min($done, $totalPkgs), $totalPkgs)
+                } elseif ($done -gt 0) {
+                    $parts += ('已处理 ' + $done + ' 个包')
+                }
+                if ($line) { $parts += $line }
+                $status = ($parts -join '  ·  ')
+                if ($status.Length -gt 110) { $status = $status.Substring(0, 110) }
+                $pct = -1
+                if ($totalPkgs -gt 0) {
+                    $pct = [int](100 * [Math]::Min($done, $totalPkgs) / $totalPkgs)
+                    if ($pct -gt 99) { $pct = 99 }
+                }
+                Write-Progress -Id 11 -Activity $Label -Status $status -PercentComplete $pct
             }
         }
         Start-Sleep -Milliseconds 900
     }
+    Write-Progress -Id 11 -Activity $Label -Completed
 
     # PS 5.1 的坑：Start-Process -PassThru 不配 -Wait 时，ExitCode 常常是 $null
     try { $null = $Process.WaitForExit(5000) } catch { }
@@ -900,6 +941,40 @@ function Install-Python312 {
     return $py
 }
 
+# 镜像测速：同一个包，不同镜像能差好几倍。先量一下再决定用哪个。
+function Get-IndexSpeed([string]$IndexUrl) {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        $null = Get-TextWithTimeout -Url ($IndexUrl.TrimEnd('/') + '/astrbot/') -TimeoutSec 8
+        $sw.Stop()
+        return [int]$sw.ElapsedMilliseconds
+    } catch {
+        $sw.Stop()
+        return 99999
+    }
+}
+
+function Sort-IndexesBySpeed([string[]]$Indexes) {
+    if ($Indexes.Count -le 1) { return $Indexes }
+    $scored = @()
+    $i = 0
+    foreach ($idx in $Indexes) {
+        $i++
+        if (-not $Quiet) {
+            Write-Progress -Id 13 -Activity '挑选最快的 PyPI 镜像' -Status $idx `
+                -PercentComplete ([int](100 * ($i - 1) / $Indexes.Count))
+        }
+        $ms = Get-IndexSpeed $idx
+        $scored += [pscustomobject]@{ Url = $idx; Ms = $ms }
+    }
+    Write-Progress -Id 13 -Activity '挑选最快的 PyPI 镜像' -Completed
+
+    $sorted = @($scored | Sort-Object Ms | ForEach-Object { $_.Url })
+    $best = $scored | Sort-Object Ms | Select-Object -First 1
+    if ($best -and $best.Ms -lt 9000) { Info ('最快的镜像：' + $best.Url + '（' + $best.Ms + ' ms）') }
+    return $sorted
+}
+
 # 路线 A：在 ds-as-nap\astrbot 建独立 venv，走 PyPI 镜像装
 # 路线 A：在 ds-as-nap\astrbot 里建独立 venv，把 astrbot 装进去（全部走 PyPI 镜像）
 function Install-AstrBotViaUv {
@@ -935,6 +1010,8 @@ function Install-AstrBotViaUv {
         'https://mirrors.aliyun.com/pypi/simple',
         'https://mirrors.cernet.edu.cn/pypi/web/simple'
     )
+    # 先量一下哪个镜像快：装 300 多个包，源慢一倍就是十几分钟
+    $indexes = @(Sort-IndexesBySpeed $indexes)
     foreach ($idx in $indexes) {
         Info ('装 astrbot 到这个环境  ←  ' + $idx)
         $log = Join-Path $script:LogDir ('astrbot-pip-{0}.log' -f (Get-Date -Format 'HHmmss'))
@@ -1391,12 +1468,20 @@ function Find-NapCat {
     # 用户机器上已有的 NapCat（桌面/下载目录），能直接用就用
     $searchRoots = @("$env:USERPROFILE\Desktop", "$env:USERPROFILE\Downloads", $script:Root, "$env:ProgramFiles", "$env:LOCALAPPDATA")
     $candidates = @()
+    $ri = 0
     foreach ($r in $searchRoots) {
+        $ri++
         if (-not (Test-Path $r)) { continue }
+        # 扫目录可能要几秒，给个进度，别让人以为卡死了
+        if (-not $Quiet) {
+            Write-Progress -Id 12 -Activity '查找机器上已有的 NapCat' -Status ($r) `
+                -PercentComplete ([int](100 * $ri / $searchRoots.Count))
+        }
         foreach ($h in (Get-ChildItem $r -Recurse -Depth 3 -Filter 'NapCatWinBootMain.exe' -ErrorAction SilentlyContinue)) {
             $candidates += (Split-Path $h.FullName -Parent)
         }
     }
+    Write-Progress -Id 12 -Activity '查找机器上已有的 NapCat' -Completed
     $good = @()
     foreach ($c in @($candidates | Select-Object -Unique)) {
         if (Test-NapCatRoot $c) { $good += $c; continue }
