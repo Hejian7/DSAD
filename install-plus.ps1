@@ -25,6 +25,8 @@ function Say([string]$T, [string]$C = 'Gray') { Write-Host $T -ForegroundColor $
 
 $mirrors = @(
     "https://raw.githubusercontent.com/$Repo/$Branch",
+    "https://cdn.jsdelivr.net/gh/$Repo@$Branch",
+    "https://fastly.jsdelivr.net/gh/$Repo@$Branch",
     "https://ghproxy.net/https://raw.githubusercontent.com/$Repo/$Branch",
     "https://ghfast.top/https://raw.githubusercontent.com/$Repo/$Branch"
 )
@@ -37,7 +39,7 @@ function Get-Remote([string]$RelPath, [string]$Dest) {
         $url = $base.TrimEnd('/') + '/' + $RelPath
         try {
             Say ('    下载 ' + $RelPath + '  ←  ' + ([Uri]$url).Host) 'DarkGray'
-            Invoke-WebRequest -Uri $url -OutFile $Dest -UseBasicParsing -TimeoutSec 60
+            Invoke-WebRequest -Uri $url -OutFile $Dest -UseBasicParsing -TimeoutSec 20
             if ((Get-Item $Dest).Length -gt 0) { return $true }
         } catch {
             Say ('      不通：' + $_.Exception.Message) 'DarkGray'
