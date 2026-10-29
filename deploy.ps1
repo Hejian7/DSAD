@@ -42,6 +42,7 @@ param(
     [switch]$Group,
     [string]$WakeWord = '小五',
     [string]$GroupId = '',
+    [string]$OwnerQQ = '',
     [switch]$KeepNapCatRunning,
     [switch]$InstallWatchdog,
     [switch]$SkipNetworkCheck,
@@ -71,6 +72,8 @@ $script:CurrentStage = ''
 $script:MarkerFile = Join-Path $script:Root '.install-in-progress.json'
 $script:LockFile = Join-Path $script:Root '.deploy.lock'
 $script:NapCatCache = $null
+$script:QrViewers = @()
+$script:TestApiPort = 31777
 
 # 双击两次是最常见的人为事故：两个部署同时改同一份配置，最后谁对谁错说不清
 function Enter-DeployLock {
@@ -1402,7 +1405,7 @@ function Assert-VersionMatch([string]$NapCatPath, $QqInfo) {
 }
 
 function Set-NapCatConfig([string]$NapCatPath, [string]$QQNumber, [int]$Port, [string]$Token) {
-    Step 5 '把服务端信息写进 NapCat（反向 WS 客户端）'
+    Step 6 '把服务端信息写进 NapCat（反向 WS 客户端）'
 
     $dirs = @(Get-NapCatConfigDirs $NapCatPath)
     if ($dirs.Count -eq 0) { Fail '找不到 NapCat 的 config 目录' ('路径：' + $NapCatPath + '；NapCat 可能没装完整。') }
@@ -1470,10 +1473,32 @@ function Set-NapCatConfig([string]$NapCatPath, [string]$QQNumber, [int]$Port, [s
     Set-Prop $mine 'heartInterval' 30000
     Set-Prop $mine 'verifyCertificate' $true
     $store.network.websocketClients = $clients
+
+    # 本地 HTTP API：只给脚本自己发一条测试消息用，绑 127.0.0.1，不对外
+    if (-not $store.network.httpServers) {
+        $store.network | Add-Member -NotePropertyName httpServers -NotePropertyValue @() -Force
+    }
+    $httpServers = @($store.network.httpServers)
+    $myHttp = $httpServers | Where-Object { $_.name -eq 'dsh-deploy' } | Select-Object -First 1
+    if (-not $myHttp) {
+        $myHttp = [pscustomobject]@{
+            name = 'dsh-deploy'; enable = $true; host = '127.0.0.1'; port = $script:TestApiPort
+            messagePostFormat = 'array'; enableForcePushEvent = $false; debug = $false; token = $Token
+        }
+        $httpServers += $myHttp
+    }
+    Set-Prop $myHttp 'enable' $true
+    Set-Prop $myHttp 'host' '127.0.0.1'
+    Set-Prop $myHttp 'port' $script:TestApiPort
+    Set-Prop $myHttp 'token' $Token
+    Set-Prop $myHttp 'messagePostFormat' 'array'
+    $store.network.httpServers = $httpServers
+
     Write-Json $target $store
 
     Ok ('已启用客户端：' + $mine.url)
     Ok '端口与 token 都和 AstrBot 一致'
+    Ok ('本地测试接口：http://127.0.0.1:' + $script:TestApiPort)
 }
 
 function Get-NapCatRunning([string]$NapCatPath) {
@@ -1483,15 +1508,21 @@ function Get-NapCatRunning([string]$NapCatPath) {
 
 function Restart-NapCat([string]$NapCatPath) {
     $running = Get-NapCatRunning $NapCatPath
-    if ($running.Count -eq 0) { return }
-    Info ('重启 NapCat 让新配置生效（停掉 PID ' + (($running | ForEach-Object { $_.ProcessId }) -join ',') + '）')
-    foreach ($p in $running) {
-        foreach ($k in @(Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -eq $p.ProcessId })) {
-            Stop-Process -Id $k.ProcessId -Force -ErrorAction SilentlyContinue
+    if ($running.Count -gt 0) {
+        Info ('重启 NapCat 让新配置生效（停掉 PID ' + (($running | ForEach-Object { $_.ProcessId }) -join ',') + '）')
+        foreach ($p in $running) {
+            foreach ($k in @(Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -eq $p.ProcessId })) {
+                Stop-Process -Id $k.ProcessId -Force -ErrorAction SilentlyContinue
+            }
+            Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
         }
-        Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 4
     }
-    Start-Sleep -Seconds 4
+    # 停了就要拉起来，不然配置写完了也没人读
+    $boot = Join-Path $NapCatPath 'NapCatWinBootMain.exe'
+    if (Test-Path $boot) {
+        try { Start-Process -FilePath $boot -WorkingDirectory $NapCatPath | Out-Null } catch { }
+    }
 }
 
 function Test-NapCatConnected([int]$Port) {
@@ -1513,22 +1544,40 @@ function Get-NapCatWebUi([string]$NapCatPath) {
 }
 
 function Open-QrFile([string]$Path) {
-    if (-not (Test-Path $Path)) { return $false }
-    try { Start-Process -FilePath $Path; return $true } catch { }
-    try { Start-Process -FilePath 'mspaint.exe' -ArgumentList ('"' + $Path + '"'); return $true } catch { }
-    return $false
+    if (-not (Test-Path $Path)) { return $null }
+    try { $p = Start-Process -FilePath $Path -PassThru; $script:QrViewers += $p; return $p } catch { }
+    try { $p = Start-Process -FilePath 'mspaint.exe' -ArgumentList ('"' + $Path + '"') -PassThru; $script:QrViewers += $p; return $p } catch { }
+    return $null
 }
 
-# 扫码这一步最容易让人懵，所以把话说满：大标题、扫哪个号、扫完会怎样、文件在哪
-function Show-QrCode([string]$Path, [string]$QQNumber) {
+# 扫码成功后要能把我们打开的看图窗口关掉，不能让它一直杵在那儿
+function Close-QrViewers {
+    $n = 0
+    foreach ($p in @($script:QrViewers)) {
+        try {
+            if ($p -and -not $p.HasExited) {
+                [void]$p.CloseMainWindow()
+                Start-Sleep -Milliseconds 400
+                if (-not $p.HasExited) { $p.Kill() }
+                $n++
+            }
+        } catch { }
+    }
+    $script:QrViewers = @()
+    return $n
+}
+
+# 扫码这一步最容易让人懵，所以把话说满
+function Show-QrCode([string]$Path, [string]$ExpectQQ) {
     Say ''
     Say '  ============================================================' 'Cyan'
-    Say '   现在用手机 QQ 扫下面这张二维码' 'Cyan'
+    Say '   现在扫这张二维码 —— 请用【机器人小号】扫' 'Cyan'
     Say '  ============================================================' 'Cyan'
     Say ''
     Say '   第 1 步：打开手机 QQ → 右上角「+」→ 扫一扫'
-    Say ('   第 2 步：登录的号必须是  ' + $QQNumber + '    ← 别扫成自己的常用号') 'Yellow'
-    Say '   第 3 步：扫完就放那儿，程序会自己往下走，不用按任何键'
+    Say '   第 2 步：用你准备当机器人的【小号】扫，别用平时自己聊天的号'
+    if ($ExpectQQ) { Say ('            （脚本里填的号是 ' + $ExpectQQ + '，扫的和它不一样也没关系）') 'Yellow' }
+    Say '   第 3 步：扫完就放那儿，我会自动检测、关掉二维码、继续往下配'
     Say ''
     Say ('   二维码文件：' + $Path) 'DarkGray'
     if (Open-QrFile $Path) {
@@ -1539,24 +1588,65 @@ function Show-QrCode([string]$Path, [string]$QQNumber) {
     Say ''
 }
 
-function Wait-NapCatLogin([string]$NapCatPath, [string]$QQNumber, [int]$Port) {
-    if (Test-NapCatConnected $Port) { return $true }
+# 登录成功的可靠信号：NapCat 会给登录的号写一份 napcat_<QQ>.json（账号级配置）。
+# 只看 TCP 连接是不够的——扫了别的号时，配置写在那个人名下，永远连不上。
+function Get-NapCatLoginMarker([string]$NapCatPath) {
+    $best = $null
+    foreach ($d in @(Get-NapCatConfigDirs $NapCatPath)) {
+        foreach ($f in @(Get-ChildItem $d -Filter 'napcat_*.json' -ErrorAction SilentlyContinue)) {
+            if ($f.Name -notmatch '^napcat_(\d{5,12})\.json$') { continue }
+            if (-not $best -or $f.LastWriteTime -gt $best.Time) {
+                $best = [pscustomobject]@{ QQ = $matches[1]; Time = $f.LastWriteTime; File = $f.FullName }
+            }
+        }
+    }
+    return $best
+}
 
+# 返回登录成功的 QQ 号；超时/中断返回 $null
+function Wait-NapCatLogin([string]$NapCatPath, [string]$ExpectQQ, [int]$Port) {
     $start = Get-Date
+    $before = Get-NapCatLoginMarker $NapCatPath
+
+    if (Test-NapCatConnected $Port) {
+        if ($before) { return $before.QQ }
+        return $ExpectQQ
+    }
+
     $deadline = $start.AddMinutes(6)
     $lastKey = ''
     $lastScan = [DateTime]::MinValue
     $lastBeat = 0
     $lastReopen = 0
     $reopenCount = 0
+    $adoptedOld = $false
 
     while ((Get-Date) -lt $deadline) {
         if ($script:InterruptRequested) { throw '用户已请求中断' }
-        if (Test-NapCatConnected $Port) { return $true }
-
         $elapsed = [int]((Get-Date) - $start).TotalSeconds
 
-        # 每 2 秒找一次二维码；新出或更新过就展示
+        # 信号 1：出现比开始时间更新的账号配置 → 刚刚扫码登录成功
+        $m = Get-NapCatLoginMarker $NapCatPath
+        if ($m -and $m.Time -gt $start.AddSeconds(-2)) {
+            [void](Close-QrViewers)
+            return $m.QQ
+        }
+        # 信号 2：已经连上 AstrBot
+        if (Test-NapCatConnected $Port) {
+            [void](Close-QrViewers)
+            if ($m) { return $m.QQ }
+            return $ExpectQQ
+        }
+        # 信号 3：本来就是登录状态（没有新文件）。
+        # 只在“没在展示二维码”时才认领，否则会把正在等扫码的流程抢跑。
+        if (-not $adoptedOld -and -not $lastKey -and $m -and $elapsed -ge 90 -and $m.Time -gt $start.AddMinutes(-30)) {
+            $adoptedOld = $true
+            Info ('检测到这个号已经是登录状态：' + $m.QQ)
+            [void](Close-QrViewers)
+            return $m.QQ
+        }
+
+        # 每 2 秒找一次二维码，新出或更新就展示
         if (((Get-Date) - $lastScan).TotalSeconds -ge 2) {
             $lastScan = Get-Date
             $qr = Get-ChildItem $NapCatPath -Recurse -Filter 'qrcode.png' -ErrorAction SilentlyContinue |
@@ -1565,28 +1655,27 @@ function Wait-NapCatLogin([string]$NapCatPath, [string]$QQNumber, [int]$Port) {
                 $key = $qr.FullName + '|' + $qr.LastWriteTime.Ticks
                 if ($key -ne $lastKey) {
                     $lastKey = $key
-                    Show-QrCode $qr.FullName $QQNumber
+                    Show-QrCode $qr.FullName $ExpectQQ
                     $lastReopen = $elapsed
                     $reopenCount = 0
                 }
             }
         }
 
-        # 二维码可能被客户关掉了：每 90 秒再打开一次，最多 3 次
+        # 二维码可能被关掉了：每 90 秒再打开一次，最多 3 次
         if ($lastKey -and ($elapsed - $lastReopen) -ge 90 -and $reopenCount -lt 3) {
             $reopenCount++
             $lastReopen = $elapsed
             $qrPath = ($lastKey -split '\|')[0]
             if (Test-Path $qrPath) {
-                Say ('   再帮你打开一次二维码（第 ' + $reopenCount + ' 次）：' + $qrPath) 'DarkGray'
+                Say ('   再帮你打开一次二维码（第 ' + $reopenCount + ' 次）') 'DarkGray'
                 [void](Open-QrFile $qrPath)
             }
         }
 
-        # 进程没了就立刻停，别让客户对着黑屏等 6 分钟
         if (-not (Get-NapCatRunning $NapCatPath)) {
             Warn 'NapCat 进程已经不在了（登录窗口是不是被关掉了？）'
-            return $false
+            return $null
         }
 
         if (($elapsed - $lastBeat) -ge 30) {
@@ -1596,16 +1685,29 @@ function Wait-NapCatLogin([string]$NapCatPath, [string]$QQNumber, [int]$Port) {
         }
         Start-Sleep -Milliseconds 900
     }
+    return $null
+}
+
+function Wait-NapCatConnected([int]$Port, [int]$TimeoutSec = 120) {
+    $start = Get-Date
+    $deadline = $start.AddSeconds($TimeoutSec)
+    $lastBeat = -15
+    while ((Get-Date) -lt $deadline) {
+        if ($script:InterruptRequested) { throw '用户已请求中断' }
+        if (Test-NapCatConnected $Port) { return $true }
+        $elapsed = [int]((Get-Date) - $start).TotalSeconds
+        if (($elapsed - $lastBeat) -ge 15) {
+            $lastBeat = $elapsed
+            Info ('等 NapCat 连上 AstrBot…… 已等 ' + $elapsed + ' 秒')
+        }
+        Start-Sleep -Milliseconds 900
+    }
     return $false
 }
 
-function Start-NapCat([string]$NapCatPath, [string]$QQNumber, [int]$Port) {
-    Step 6 '启动 NapCat，扫码登录'
-
-    if (Test-NapCatConnected $Port) {
-        Ok 'NapCat 已经连着 AstrBot 了，这次不用扫码'
-        return
-    }
+# 启动 NapCat → 扫码 → 返回实际登录的 QQ 号（这才是准的，不是参数里那个）
+function Start-NapCat([string]$NapCatPath, [string]$ExpectQQ, [int]$Port) {
+    Step 5 '启动 NapCat，用小号扫码登录'
 
     $boot = Join-Path $NapCatPath 'NapCatWinBootMain.exe'
     if (-not (Test-Path $boot)) {
@@ -1616,6 +1718,19 @@ function Start-NapCat([string]$NapCatPath, [string]$QQNumber, [int]$Port) {
     if ($running.Count -gt 0) {
         Ok ('NapCat 已经在运行（PID ' + (($running | ForEach-Object { $_.ProcessId }) -join ',') + '）')
     } else {
+        Say ''
+        Say '  ------------------------------------------------------------' 'Cyan'
+        Say '   下一步要扫码登录，请准备好【机器人小号】' 'Cyan'
+        Say '  ------------------------------------------------------------' 'Cyan'
+        Say '   · 这个号以后就是替你回消息的机器人，别用你自己的常用号'
+        if ($ExpectQQ) { Say ('   · 脚本里填的是 ' + $ExpectQQ + '；扫成别的号也行，脚本会以你实际扫的为准') 'Yellow' }
+        Say '   · 扫完我会自动检测、把二维码窗口关掉，然后继续配置'
+        Say ''
+        if (-not $Quiet) {
+            $ans = Read-Host '   准备好了按回车开始（输入 n 取消）'
+            if ($ans -match '^[nN]') { Fail '已取消，什么都没有改动' '想装的时候重新跑一次就行。' }
+        }
+
         try {
             Start-Process -FilePath $boot -WorkingDirectory $NapCatPath | Out-Null
             Ok 'NapCat 已启动（会拉起 QQ 登录窗口，别关它）'
@@ -1625,35 +1740,93 @@ function Start-NapCat([string]$NapCatPath, [string]$QQNumber, [int]$Port) {
     }
 
     Say ''
-    Say '   接下来：NapCat 拉起 QQ → 生成登录二维码 → 我自动帮你打开。' 'White'
+    Say '   接下来：NapCat 拉起 QQ → 生成二维码 → 我自动打开。' 'White'
     Say '   出现二维码之前可能要等十几秒，别急，也别关窗口。' 'DarkGray'
     Say ''
 
-    $ok = Wait-NapCatLogin $NapCatPath $QQNumber $Port
-    if (-not $ok) {
+    $qq = Wait-NapCatLogin $NapCatPath $ExpectQQ $Port
+    if (-not $qq) {
         $web = Get-NapCatWebUi $NapCatPath
         $webHint = ''
-        if ($web) {
-            $webHint = "`n4) 去 NapCat 面板手动登录：$($web.Url)   （token：$($web.Token)）"
-        }
-        Fail '等了 6 分钟，还是没登录成功' @"
+        if ($web) { $webHint = "`n4) 去 NapCat 面板手动登录：$($web.Url)   （token：$($web.Token)）" }
+        Fail '等了 6 分钟，没检测到登录成功' @"
 按顺序排查：
 
   1) 二维码没看到 / 过期了：重跑一遍本脚本，会重新出码并自动打开
-  2) 扫成了别的号：必须是 QQ $QQNumber
-  3) NapCat 的登录窗口是不是被关掉了？关掉就得重跑
+  2) NapCat 的登录窗口是不是被关掉了？关掉就得重跑
 $webHint
-  5) 杀软拦了注入（QQ 闪退 / 一直转圈）：把
+  4) 杀软拦了注入（QQ 闪退 / 一直转圈）：把
      $NapCatPath
      整个目录加进白名单，再用管理员重跑
 "@
     }
 
-    Ok 'NapCat 已连上 AstrBot（反向 WS 通）'
-    Say '   扫码成功，登录凭证会留下来，下次重启不用再扫。' 'Green'
+    Ok ('登录成功：' + $qq)
+    return $qq
 }
 
 # ── 自检 / 守护 / 回滚 ────────────────────────────────────────────────────
+function Send-OneBotPrivateMsg([int]$ApiPort, [string]$Token, [string]$ToQQ, [string]$Text) {
+    $url = 'http://127.0.0.1:' + $ApiPort + '/send_private_msg?access_token=' + [Uri]::EscapeDataString($Token)
+    $payload = [pscustomobject]@{
+        user_id = [long]$ToQQ
+        message = @(@{ type = 'text'; data = @{ text = $Text } })
+    } | ConvertTo-Json -Depth 6 -Compress
+    $req = [System.Net.HttpWebRequest]::Create($url)
+    $req.Method = 'POST'
+    $req.ContentType = 'application/json'
+    $req.Timeout = 10000
+    $req.ReadWriteTimeout = 10000
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
+    $req.ContentLength = $bytes.Length
+    $rs = $req.GetRequestStream()
+    $rs.Write($bytes, 0, $bytes.Length)
+    $rs.Close()
+    $resp = $req.GetResponse()
+    try {
+        $reader = New-Object System.IO.StreamReader($resp.GetResponseStream(), [System.Text.Encoding]::UTF8)
+        try { return $reader.ReadToEnd() } finally { $reader.Close() }
+    } finally { $resp.Close() }
+}
+
+function Invoke-TestMessage($Token, [string]$BotQQ) {
+    $owner = $OwnerQQ
+    if (-not $owner -and -not $Quiet) {
+        Say ''
+        $owner = Read-Host '   输入你自己（主人）的 QQ 号，让机器人给你发条测试消息（回车跳过）'
+    }
+    if (-not $owner -or $owner -notmatch '^\d{5,12}$') {
+        Info '跳过测试消息（没给主人号）。之后可以自己给小号发一句话验证。'
+        return
+    }
+    if ($owner -eq $BotQQ) {
+        Info '主人号和机器人号是同一个，跳过测试消息。'
+        return
+    }
+    Step '测试' '让机器人给你发一条消息'
+    try {
+        $r = Send-OneBotPrivateMsg -ApiPort $script:TestApiPort -Token $Token -ToQQ $owner -Text '部署完成，这是一条自动测试消息。收到就说明整条链路通了。'
+        if ($r -match '"status"\s*:\s*"ok"') {
+            Ok ('已发送到 ' + $owner + '，去 QQ 里看看收到没有')
+        } else {
+            Warn ('接口返回了异常：' + $r)
+        }
+    } catch {
+        Warn ('测试消息没发出去：' + $_.Exception.Message)
+        Info '常见原因：NapCat 的本地 HTTP 接口被占用或没起来。不影响机器人本身，你自己给小号发句话也能验证。'
+    }
+}
+
+function Open-Panel([string]$Url, [string]$Label) {
+    if (-not $Url) { return }
+    try {
+        Start-Process $Url | Out-Null
+        Ok ('已打开 ' + $Label + '：' + $Url)
+    } catch {
+        Info ('打不开浏览器，手动访问：' + $Url)
+    }
+}
+
 function Invoke-SelfCheck([int]$Port, $Target) {
     Step 7 '自检'
     $bad = 0
@@ -2009,27 +2182,58 @@ try {
     }
     Ok ('AstrBot 服务端就绪：' + $ob.Port)
 
-    Set-NapCatConfig $napRoot $QQ $ob.Port $ob.Token
-
+    # 5) 启动 NapCat 并扫码 —— 这一步还不知道客户会扫哪个号，所以先不写配置
     if (-not $KeepNapCatRunning) {
+        $actualQQ = Start-NapCat $napRoot $QQ $ob.Port
+        if ($actualQQ -and ($actualQQ -ne $QQ)) {
+            Say ''
+            Warn ('你扫的号是 ' + $actualQQ + '，脚本里填的是 ' + $QQ)
+            Info ('以你实际扫的号为准，下面都按 ' + $actualQQ + ' 配；想换成 ' + $QQ + ' 就重跑并换号扫')
+            $QQ = $actualQQ
+        }
+
+        # 6) 拿到真实号之后再写配置：NapCat 按 QQ 号分文件存配置，写错号等于没写
+        Set-NapCatConfig $napRoot $QQ $ob.Port $ob.Token
+        Info '重启 NapCat 让配置生效（已登录，不用再扫码）'
         Restart-NapCat $napRoot
-        Start-NapCat $napRoot $QQ $ob.Port
+        if (-not (Wait-NapCatConnected $ob.Port 120)) {
+            Fail 'NapCat 重启后没有连上 AstrBot' @"
+配置写进去了（记在 QQ $QQ 名下），但它没连上来。可能原因：
+  1) 重启后没有自动登录（需要再扫一次码）：重跑本脚本
+  2) AstrBot 的 token 和 NapCat 里不一致：重跑一次会自动对齐
+  3) NapCat 面板里看看连接状态：http://127.0.0.1:6099
+"@
+        }
+        Ok 'NapCat 已连上 AstrBot（反向 WS 通）'
     } else {
-        Info '按 -KeepNapCatRunning 跳过 NapCat 重启：配置等它下次启动才生效'
+        Info '按 -KeepNapCatRunning 跳过 NapCat 启动与扫码：配置等它下次启动才生效'
     }
 
     Invoke-SelfCheck $ob.Port $ab | Out-Null
 
     if ($InstallWatchdog) { Install-Watchdog }
 
+    # 自检消息：让机器人主动给主人发一条，客户立刻能看到“活的”
+    Invoke-TestMessage $ob.Token $QQ
+
+    # 配置完成 → 打开两个面板
+    $webNap = Get-NapCatWebUi $napRoot
     Say ''
-    Say '部署完成。' 'Green'
-    Say ('  机器人 QQ：' + $QQ)
-    Say '  AstrBot 面板：http://127.0.0.1:6185'
-    Say ('  日志目录：' + $script:LogDir)
+    Say '  ============================================================' 'Green'
+    Say '   配置完成 ✔' 'Green'
+    Say '  ============================================================' 'Green'
     Say ''
-    Say '  现在去 QQ 里给这个号发一句话试试（群里要先 @ 它）。' 'White'
-    Say '  之后日常用「启动.cmd / 停止.cmd / 状态.cmd」，不用再跑这个部署脚本。' 'DarkGray'
+    Say ('   机器人 QQ：' + $QQ)
+    if ($webNap) { Say ('   NapCat 面板：' + $webNap.Url + '   （token：' + $webNap.Token + '）') }
+    Say '   AstrBot 面板：http://127.0.0.1:6185'
+    Say ('   日志目录：' + $script:LogDir)
+    Say ''
+    Say '   正在帮你打开两个面板（没弹出就点上面的地址）……' 'DarkGray'
+    if ($webNap) { Open-Panel $webNap.Url 'NapCat 面板' }
+    Open-Panel 'http://127.0.0.1:6185' 'AstrBot 面板'
+    Say ''
+    Say '   接下来：用手机 QQ 给这个机器人发一句话试试（群里要先 @ 它）。' 'White'
+    Say '   日常用「启动.cmd / 停止.cmd / 状态.cmd」，不用再跑这个部署脚本。' 'DarkGray'
     Say ''
     Clear-RunMarker
     Set-WindowTitle '部署完成'
