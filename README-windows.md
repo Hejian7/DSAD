@@ -56,7 +56,8 @@ GitHub 直连、ghproxy。每条 5 秒超时，结果直接打在屏幕上（通
 - 系统代理会被自动识别（环境变量 → IE 设置），并且**先探活再使用**：代理死了就自动改直连，
   不会因为一个坏代理把整台机器误判成"没网"。
 - 一个 PyPI 镜像都不通 → 直接停在第一步，告诉你该查联网、代理还是 DNS，而不是让你干等十分钟。
-- GitHub 不通会明确提示：NapCat 会走镜像，官方安装脚本里的 uv 下载会失败。
+- GitHub 不通也没关系：AstrBot 走 PyPI 镜像直装，NapCat 走 ghproxy；只有 ghproxy 也挂了才需要手动放安装包。
+- 代理会「先探活再用」，而且一旦请求失败就自动摘掉代理改直连重试一次——注册表里配着个死代理的机器很常见。
 - 老系统上还会强制打开 TLS 1.2/1.3——不打开的话下载会报"基础连接已经关闭"这种鬼话。
 
 **2. 全程有进度**
@@ -94,7 +95,11 @@ GitHub 直连、ghproxy。每条 5 秒超时，结果直接打在屏幕上（通
 ## 它到底做了什么
 
 1. **环境检查**：PowerShell 5.1+、64 位、磁盘 ≥3 GB、**联网预检**（各下载源是否可达、代理是否活着）、是否管理员。
-2. **AstrBot**：没装就下载官方 `install.ps1`，用 `-Language zh-CN -DownloadSource china -NonInteractive` 跑（下载走大陆镜像，Python 3.12 走 USTC 源）；装完找 `astrbot` 命令（PATH / `%USERPROFILE%\.local\bin` / `%APPDATA%\uv\tools\astrbot`）。
+2. **AstrBot**：没装就装，两条路线，先试 A：
+   - **路线 A（默认）**：`uv` 从 PyPI 镜像取 wheel → Python 3.12 从 npmmirror 取官方安装包静默装 →
+     `uv tool install astrbot --python <3.12> --default-index <镜像>`。**全程不碰 GitHub**。
+   - **路线 B（兜底）**：A 全失败才下载官方 `install.ps1` 照原样跑。
+   - 装完找 `astrbot` 命令（PATH / `%USERPROFILE%\.local\bin` / `%APPDATA%\uv\tools\astrbot`）。
 3. **初始化**：CLI 形态建工作目录并 `astrbot init`；没生成配置就先 `astrbot run` 一次把它逼出来。
 4. **写 AstrBot**：`aiocqhttp` 平台（端口 + token，没有就建、有就沿用）、DeepSeek 模型（给了 Key 才写）、把你的 QQ 加进管理员。
 5. **NapCat**：找真正的根目录（`bootmain` 是壳，判断标准是**有没有 config**）；找不到就下 `NapCat.Shell.zip`。

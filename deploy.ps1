@@ -74,26 +74,9 @@ function Set-WindowTitle([string]$Text) {
     try { $Host.UI.RawUI.WindowTitle = 'DSH 部署 · ' + $Text } catch { }
 }
 
-# 输出被重定向到文件/管道时，\r 原地刷新只会刷出一堆空格和空行，直接关掉
-function Test-InlineAllowed {
-    if ($Quiet) { return $false }
-    try { if ([Console]::IsOutputRedirected) { return $false } } catch { }
-    return $true
-}
-
-# 单行原地刷新（下载进度、安装计时都靠它）
-function Write-Inline([string]$Text) {
-    if (-not (Test-InlineAllowed)) { return }
-    try {
-        $w = $Host.UI.RawUI.WindowSize.Width
-        if ($w -gt 20 -and $Text.Length -ge ($w - 1)) { $Text = $Text.Substring(0, $w - 2) }
-        Write-Host ("`r" + $Text.PadRight(78)) -NoNewline -ForegroundColor DarkGray
-    } catch { }
-}
-function Clear-Inline {
-    if (-not (Test-InlineAllowed)) { return }
-    Write-Host ("`r" + (' ' * 78) + "`r") -NoNewline
-}
+# 注意：不要在这里加 `\r` 原地刷新的“进度条”。
+# 中文控制台里用 \r 覆写会让双字节字符错位，屏幕上出现重影（如“位位系系统统”），
+# 而且上一轮的残留会和新输出糊在一起。进度一律用普通整行输出。
 
 # TLS 1.2/1.3 + 系统代理：老机器上最常见的两类“莫名其妙连不上”
 function Initialize-NetClient {
@@ -139,7 +122,7 @@ function Initialize-NetClient {
 # 实测在装了安全软件的机器上，`Invoke-WebRequest @p` 会让 PowerShell 5.1
 # 无声无息地整个进程退出（退出码 0、无报错），排查成本极高。
 # 直接用 HttpWebRequest，行为和超时都可控。
-function Test-Endpoint([string]$Url, [int]$TimeoutSec = 5, [switch]$Head) {
+function Test-Endpoint([string]$Url, [int]$TimeoutSec = 5, [switch]$Head, [switch]$NoProxyRetry) {
     $sw = [Diagnostics.Stopwatch]::StartNew()
     $ms = 0
     try {
@@ -169,9 +152,19 @@ function Test-Endpoint([string]$Url, [int]$TimeoutSec = 5, [switch]$Head) {
                 }
             }
         } catch { }
+        # 代理挂了就改直连再探一次，别让一个死代理把整台机器判成没网
+        if ($script:ProxyUrl -and -not $NoProxyRetry) {
+            Warn ('走代理连不上，改直连重试：' + $Url)
+            $script:ProxyUrl = $null
+            return (Test-Endpoint -Url $Url -TimeoutSec $TimeoutSec -Head:$Head -NoProxyRetry)
+        }
         return [pscustomobject]@{ Ok = $false; Ms = $ms; Status = 0; Error = $we.Message }
     } catch {
         $sw.Stop()
+        if ($script:ProxyUrl -and -not $NoProxyRetry) {
+            $script:ProxyUrl = $null
+            return (Test-Endpoint -Url $Url -TimeoutSec $TimeoutSec -Head:$Head -NoProxyRetry)
+        }
         return [pscustomobject]@{ Ok = $false; Ms = [int]$sw.ElapsedMilliseconds; Status = 0; Error = $_.Exception.Message }
     }
 }
@@ -194,14 +187,13 @@ function Test-NetworkProfile {
     $i = 0
     foreach ($t in $targets) {
         $i++
-        Write-Inline ("    检测 {0}/{1}  {2} …" -f $i, $targets.Count, $t.Name)
         $r = Test-Endpoint -Url $t.Url -TimeoutSec 5 -Head
         $script:Net[$t.Key] = $r.Ok
-        Clear-Inline
         if ($r.Ok) {
             Say ("    √ {0,-16} {1,5} ms" -f $t.Name, $r.Ms) 'Green'
         } else {
-            $tag = if ($t.Must) { '（这条必须通）' } else { '' }
+            $tag = ''
+            if ($t.Must) { $tag = '（这条必须通）' }
             Say ("    ! {0,-16} 不通 {1}" -f $t.Name, $tag) 'Yellow'
         }
     }
@@ -275,17 +267,17 @@ function Get-FileWithProgress {
                         $out.Write($buf, 0, $n)
                         $done += $n
                         $now = Get-Date
-                        if (($now - $lastPaint).TotalMilliseconds -ge 300) {
+                        if (($now - $lastPaint).TotalSeconds -ge 2) {
                             $lastPaint = $now
                             $mb = $done / 1MB
                             if ($total -gt 0) {
                                 $pct = [int](100 * $done / $total)
                                 $spd = 0.0
                                 if ($sw.Elapsed.TotalSeconds -gt 0.5) { $spd = ($done / 1MB) / $sw.Elapsed.TotalSeconds }
-                                Write-Inline ('    ↓ {0}   {1:N1}/{2:N1} MB   {3}%   {4:N1} MB/s' -f $Label, $mb, ($total / 1MB), $pct, $spd)
+                                if (-not $Quiet) { Write-Host ('    · {0}  {1:N1}/{2:N1} MB  {3}%  {4:N1} MB/s' -f $Label, $mb, ($total / 1MB), $pct, $spd) -ForegroundColor DarkGray }
                                 Set-WindowTitle ('下载 ' + $Label + ' ' + $pct + '%')
                             } else {
-                                Write-Inline ('    ↓ {0}   {1:N1} MB' -f $Label, $mb)
+                                if (-not $Quiet) { Write-Host ('    · {0}  {1:N1} MB' -f $Label, $mb) -ForegroundColor DarkGray }
                                 Set-WindowTitle ('下载 ' + $Label + ' ' + ('{0:N1}' -f $mb) + ' MB')
                             }
                         }
@@ -296,7 +288,6 @@ function Get-FileWithProgress {
             } finally {
                 $resp.Close()
             }
-            Clear-Inline
             if ($total -gt 0 -and $done -ne $total) { throw ('下载不完整（' + $done + '/' + $total + ' 字节）') }
             if ($Sha256) {
                 $h = (Get-FileHash $tmp -Algorithm SHA256).Hash.ToLower()
@@ -306,9 +297,15 @@ function Get-FileWithProgress {
             Move-Item $tmp $OutFile -Force
             return $true
         } catch {
-            Clear-Inline
             if ($script:InterruptRequested) { throw }
             if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
+            # 代理最坑：注册表里配着、进程早死了。显式挂一个死代理会让所有请求全灭。
+            if ($script:ProxyUrl) {
+                Warn ('连不上，怀疑代理已失效，改为直连重试（' + $_.Exception.Message + '）')
+                $script:ProxyUrl = $null
+                $attempt = $attempt - 1
+                continue
+            }
             if ($attempt -eq $MaxRetry) { throw }
             Warn ('下载出错：' + $_.Exception.Message)
             Start-Sleep -Seconds 2
@@ -323,9 +320,7 @@ function Get-FileFromMirrors {
     $file = Split-Path $OutFile -Leaf
     foreach ($m in $Mirrors) {
         Info ('下载 {0}  ←  {1}' -f $file, $m.Name)
-        Write-Inline ('    · ' + $m.Url)
-        Start-Sleep -Milliseconds 150
-        Clear-Inline
+        Info ('    ' + $m.Url)
         try {
             $null = Get-FileWithProgress -Url $m.Url -OutFile $OutFile -Label $m.Name -Sha256 $Sha256 -MaxRetry $MaxRetry
             Ok ('下载完成（{0:N1} MB，源：{1}）' -f ((Get-Item $OutFile).Length / 1MB), $m.Name)
@@ -338,11 +333,32 @@ function Get-FileFromMirrors {
     return $false
 }
 
-# 子进程跑到一半的“进度”：计时 + 日志尾巴，避免黑屏干等
+# 读日志尾巴：子进程的输出编码跟控制台走（有 chcp 65001 就是 UTF-8，否则 GBK），
+# 先按 UTF-8 解码，出现替换字符就说明其实是 GBK，换一种再读。
+function Read-LogTail([string]$Path, [int]$Lines = 1) {
+    if (-not $Path -or -not (Test-Path $Path)) { return @() }
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($Path)
+        if ($bytes.Length -eq 0) { return @() }
+        if ($bytes.Length -gt 131072) {
+            $bytes = $bytes[($bytes.Length - 131072)..($bytes.Length - 1)]
+        }
+        $u8 = [System.Text.Encoding]::UTF8.GetString($bytes)
+        $text = $u8
+        if ($u8.IndexOf([char]0xFFFD) -ge 0) {
+            try { $text = [System.Text.Encoding]::GetEncoding(936).GetString($bytes) } catch { }
+        }
+        return @($text -split "[\r\n]+" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' } | Select-Object -Last $Lines)
+    } catch { return @() }
+}
+
+# 子进程跑到一半的“进度”：计时 + 日志尾巴，每 5 秒一行，避免黑屏干等
+# 返回：真实退出码 / -2 超时 / -1 拿不到退出码（未知，交给调用方按副作用判断）
 function Wait-ProcessWithProgress {
     param($Process, [string]$Label, [int]$TimeoutSec = 900, [string]$LogPath = '')
     $sw = [Diagnostics.Stopwatch]::StartNew()
-    $lastLine = ''
+    $lastShown = ''
+    $lastPrint = -10
     while (-not $Process.HasExited) {
         if ($script:InterruptRequested) {
             try { $Process.Kill() } catch { }
@@ -353,20 +369,38 @@ function Wait-ProcessWithProgress {
             try { $Process.Kill() } catch { }
             return -2
         }
-        if ($LogPath -and (Test-Path $LogPath)) {
-            try {
-                $tail = @(Get-Content $LogPath -Tail 1 -ErrorAction SilentlyContinue)
-                if ($tail.Count -gt 0 -and $tail[0]) { $lastLine = ([string]$tail[0]).Trim() }
-            } catch { }
-        }
         $t = '{0:00}:{1:00}' -f [math]::Floor($elapsed / 60), ($elapsed % 60)
-        if ($lastLine) { Write-Inline ('    ⏳ {0}   [{1}]   {2}' -f $Label, $t, $lastLine) }
-        else { Write-Inline ('    ⏳ {0}   [{1}]   启动中…' -f $Label, $t) }
         Set-WindowTitle ($Label + ' ' + $t)
-        Start-Sleep -Milliseconds 800
+
+        # 很多工具（uv、npm、pip）把下载进度写 stderr，所以两边都看
+        $line = ''
+        if ($LogPath) {
+            $t1 = @(Read-LogTail -Path ($LogPath + '.err') -Lines 1)
+            $t2 = @(Read-LogTail -Path $LogPath -Lines 1)
+            if ($t2.Count -gt 0) { $line = [string]$t2[0] }
+            if ($t1.Count -gt 0) { $line = [string]$t1[0] }
+        }
+        if ($line.Length -gt 60) { $line = $line.Substring(0, 60) }
+
+        # 每 5 秒（或日志出了新行）打一行普通文本，绝不用 \r 覆写
+        if (($elapsed - $lastPrint) -ge 5 -or ($line -and $line -ne $lastShown)) {
+            $lastPrint = $elapsed
+            $lastShown = $line
+            if (-not $Quiet) {
+                if ($line) { Write-Host ('    · {0}  [{1}]  {2}' -f $Label, $t, $line) -ForegroundColor DarkGray }
+                else { Write-Host ('    · {0}  [{1}]  正在跑…' -f $Label, $t) -ForegroundColor DarkGray }
+            }
+        }
+        Start-Sleep -Milliseconds 900
     }
-    Clear-Inline
-    return $Process.ExitCode
+
+    # PS 5.1 的坑：Start-Process -PassThru 不配 -Wait 时，ExitCode 常常是 $null
+    try { $null = $Process.WaitForExit(5000) } catch { }
+    try { $Process.Refresh() } catch { }
+    $code = $null
+    try { $code = $Process.ExitCode } catch { }
+    if ($null -eq $code) { return -1 }
+    return [int]$code
 }
 
 # ── 中断保护：关窗按钮 + Ctrl+C + 断点标记 ─────────────────────────────────
@@ -554,9 +588,199 @@ function Get-AstrBotCli {
     return $null
 }
 
-function Install-AstrBot {
-    Step '2.1' ('部署 AstrBot（下载源：' + $DownloadSource + '）')
+# ── uv / Python：全程绕开 GitHub ───────────────────────────────────────────
+# 背景：官方 install.ps1 先从 USTC 镜像取 uv（对大文件回 403），再退回 GitHub；
+# GitHub 不通的机器就死在这一步。而 astrbot 和 uv 本身都在 PyPI 上，
+# Python 3.12 又有 npmmirror 的官方安装包——这三条都不必经过 GitHub。
 
+function Get-TextWithTimeout([string]$Url, [int]$TimeoutSec = 20) {
+    $req = [System.Net.HttpWebRequest]::Create($Url)
+    $req.UserAgent = 'DSH-Deploy/1.0'
+    $req.Timeout = $TimeoutSec * 1000
+    $req.ReadWriteTimeout = $TimeoutSec * 1000
+    $req.AllowAutoRedirect = $true
+    try {
+        $req.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate
+    } catch { }
+    if ($script:ProxyUrl) { $req.Proxy = New-Object System.Net.WebProxy($script:ProxyUrl, $true) }
+    try {
+        $resp = $req.GetResponse()
+    } catch {
+        if (-not $script:ProxyUrl) { throw }
+        Warn ('取文本失败，改直连再试：' + $_.Exception.Message)
+        $script:ProxyUrl = $null
+        $req.Proxy = $null
+        $resp = $req.GetResponse()
+    }
+    try {
+        $reader = New-Object System.IO.StreamReader($resp.GetResponseStream(), [System.Text.Encoding]::UTF8)
+        try { return $reader.ReadToEnd() } finally { $reader.Close() }
+    } finally { $resp.Close() }
+}
+
+function Add-PathEntry([string]$Dir) {
+    if (-not $Dir) { return }
+    if (($env:PATH -split ';') -notcontains $Dir) { $env:PATH = $Dir + ';' + $env:PATH }
+}
+
+function Get-UvOnPath {
+    $c = Get-Command 'uv' -ErrorAction SilentlyContinue
+    if ($c -and $c.Source) { return $c.Source }
+    foreach ($p in @(
+            (Join-Path $env:USERPROFILE '.local\bin\uv.exe'),
+            (Join-Path $env:LOCALAPPDATA 'uv\uv.exe')
+        )) {
+        if (Test-Path $p) { return $p }
+    }
+    return $null
+}
+
+# 从 PyPI 镜像的 simple 页面里挑出最新一个 win_amd64 wheel（自带 sha256）
+function Get-UvWheelFromIndex([string]$IndexUrl) {
+    $html = Get-TextWithTimeout -Url $IndexUrl -TimeoutSec 20
+    if (-not $html) { return $null }
+    $ms = [regex]::Matches($html, 'href="([^"#]+uv-[0-9][^"#]*-py3-none-win_amd64\.whl)(?:#sha256=([0-9a-fA-F]{64}))?"')
+    if ($ms.Count -eq 0) { return $null }
+    $m = $ms[$ms.Count - 1]
+    $abs = ([Uri]::new([Uri]$IndexUrl, $m.Groups[1].Value)).AbsoluteUri
+    return [pscustomobject]@{ Url = $abs; Sha256 = $m.Groups[2].Value }
+}
+
+function Ensure-Uv {
+    $existing = Get-UvOnPath
+    if ($existing) {
+        Add-PathEntry (Split-Path $existing -Parent)
+        Ok ('uv 已在：' + $existing)
+        return $existing
+    }
+
+    Info '没有 uv：从 PyPI 镜像取 wheel（约 20 MB，不走 GitHub）'
+    $binDir = Join-Path $env:USERPROFILE '.local\bin'
+    if (-not (Test-Path $binDir)) { New-Item -ItemType Directory -Path $binDir -Force | Out-Null }
+
+    $indexes = @(
+        [pscustomobject]@{ Name = '清华'; Url = 'https://pypi.tuna.tsinghua.edu.cn/simple/uv/' },
+        [pscustomobject]@{ Name = '阿里'; Url = 'https://mirrors.aliyun.com/pypi/simple/uv/' },
+        [pscustomobject]@{ Name = 'cernet'; Url = 'https://mirrors.cernet.edu.cn/pypi/web/simple/uv/' }
+    )
+    foreach ($idx in $indexes) {
+        try {
+            Info ('查索引：' + $idx.Name)
+            $info = Get-UvWheelFromIndex -IndexUrl $idx.Url
+            if (-not $info) { Warn ('这个索引里没有 win_amd64 的 wheel：' + $idx.Name); continue }
+
+            $whl = Join-Path $script:Root 'uv-wheel.zip'
+            $null = Get-FileWithProgress -Url $info.Url -OutFile $whl -Label ('uv (' + $idx.Name + ')') -Sha256 $info.Sha256 -MaxRetry 2
+            $tmp = Join-Path $script:Root 'uv-extract'
+            if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+            Expand-Archive -Path $whl -DestinationPath $tmp -Force
+            $exe = Get-ChildItem $tmp -Recurse -Filter 'uv.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $exe) { Warn 'wheel 解包后没有 uv.exe'; continue }
+
+            Copy-Item (Join-Path $exe.DirectoryName 'uv*.exe') -Destination $binDir -Force
+            Remove-Item $whl -Force -ErrorAction SilentlyContinue
+            Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+            Add-PathEntry $binDir
+
+            $uvPath = Join-Path $binDir 'uv.exe'
+            if (-not (Test-Path $uvPath)) { Warn '复制后找不到 uv.exe'; continue }
+            Ok ('uv 就位：' + (& $uvPath --version))
+            return $uvPath
+        } catch {
+            if ($script:InterruptRequested) { throw }
+            Warn ('这个镜像不行（' + $idx.Name + '）：' + $_.Exception.Message)
+        }
+    }
+    return $null
+}
+
+function Get-Python312Path {
+    try {
+        $lines = @(& py -0p 2>$null)
+        foreach ($l in $lines) {
+            $s = [string]$l
+            if ($s -match '3\.12' -and $s -match '([A-Za-z]:\\[^\r\n]*?python\.exe)') { return $matches[1] }
+        }
+    } catch { }
+    foreach ($p in @(
+            (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python312\python.exe'),
+            'C:\Program Files\Python312\python.exe',
+            (Join-Path $env:ProgramFiles 'Python312\python.exe')
+        )) {
+        if (Test-Path $p) { return $p }
+    }
+    return $null
+}
+
+function Install-Python312 {
+    Info '没有 Python 3.12：下官方安装包（npmmirror 镜像，约 27 MB）'
+    $exe = Join-Path $script:Root 'python-3.12.10-amd64.exe'
+    if (-not (Test-Path $exe)) {
+        $mirrors = @(
+            [pscustomobject]@{ Name = 'npmmirror'; Url = 'https://registry.npmmirror.com/-/binary/python/3.12.10/python-3.12.10-amd64.exe' },
+            [pscustomobject]@{ Name = 'python.org'; Url = 'https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe' }
+        )
+        if (-not (Get-FileFromMirrors -Mirrors $mirrors -OutFile $exe)) { return $null }
+    } else {
+        Info ('复用安装包：' + $exe)
+    }
+
+    Info '静默安装 Python 3.12（仅当前用户，不动系统 PATH）'
+    $ilog = Join-Path $script:LogDir ('python312-{0}.log' -f (Get-Date -Format 'HHmmss'))
+    $p = Start-Process -FilePath $exe -PassThru -Wait -NoNewWindow `
+        -ArgumentList @('/quiet', 'InstallAllUsers=0', 'PrependPath=0', 'Include_test=0', 'Include_doc=0', 'Include_launcher=0', 'Include_pip=1') `
+        -RedirectStandardOutput $ilog -RedirectStandardError ($ilog + '.err')
+    if ($p.ExitCode -ne 0) {
+        Warn ('Python 安装器返回 ' + $p.ExitCode + '，日志：' + $ilog)
+        return $null
+    }
+    $py = Get-Python312Path
+    if ($py) { Ok ('Python 3.12：' + $py) } else { Warn '装完了但没找到 python.exe' }
+    return $py
+}
+
+# 路线 A：uv tool install，全部走 PyPI 镜像
+function Install-AstrBotViaUv {
+    $uv = Ensure-Uv
+    if (-not $uv) { Warn '拿不到 uv'; return $false }
+
+    $py = Get-Python312Path
+    if (-not $py) { $py = Install-Python312 }
+    if (-not $py) { Warn '拿不到 Python 3.12'; return $false }
+    Ok ('Python 3.12：' + $py)
+
+    $indexes = @(
+        'https://pypi.tuna.tsinghua.edu.cn/simple',
+        'https://mirrors.aliyun.com/pypi/simple',
+        'https://mirrors.cernet.edu.cn/pypi/web/simple'
+    )
+    foreach ($idx in $indexes) {
+        Info ('uv tool install astrbot  ←  ' + $idx)
+        $log = Join-Path $script:LogDir ('astrbot-uv-{0}.log' -f (Get-Date -Format 'HHmmss'))
+        $p = Start-Process -FilePath $uv -PassThru -NoNewWindow `
+            -ArgumentList @('tool', 'install', 'astrbot', '--python', $py, '--default-index', $idx) `
+            -RedirectStandardOutput $log -RedirectStandardError ($log + '.err')
+        $code = Wait-ProcessWithProgress -Process $p -Label '安装 astrbot' -TimeoutSec 1200 -LogPath $log
+        if ($code -eq 0) {
+            Ok 'uv tool install 成功'
+            return $true
+        }
+        if ($code -eq -2) { Warn '装 astrbot 超时，换下一条索引'; continue }
+        # -1 = PS 拿不到退出码：以“命令有没有装出来”为准，别把成功当失败
+        if ($code -lt 0 -and (Get-AstrBotCli)) {
+            Ok 'uv tool install 完成（退出码读不到，但 astrbot 已经就位）'
+            return $true
+        }
+        $tail = ''
+        $t = @(Read-LogTail -Path ($log + '.err') -Lines 6)
+        if ($t.Count -gt 0) { $tail = ($t -join "`n") }
+        Warn ('这个索引装不下来（退出码 ' + $code + '）：' + $tail)
+    }
+    return $false
+}
+
+# 路线 B：官方 install.ps1（能连 GitHub 的机器上更快，也更“原厂”）
+function Install-AstrBotOfficial {
     $ps1 = Join-Path $script:Root 'install.astrbot.ps1'
     if (-not (Test-Path $script:Root)) { New-Item -ItemType Directory -Path $script:Root -Force | Out-Null }
 
@@ -572,46 +796,61 @@ function Install-AstrBot {
         Info ('复用已下载的安装脚本：' + $ps1)
     }
 
-    Info '接下来装 uv + Python 3.12 + astrbot，第一次 3~10 分钟，进度会实时刷'
-    if ($script:Net.ContainsKey('github') -and -not $script:Net['github']) {
-        Warn 'GitHub 不通：官方脚本内部要下的 uv 大概率失败，失败后按提示走手动方案'
+    $log = Join-Path $script:LogDir ('astrbot-install-{0}.log' -f (Get-Date -Format 'HHmmss'))
+    $proc = Start-Process -FilePath 'powershell.exe' `
+        -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $ps1, '-Language', 'zh-CN', '-DownloadSource', $DownloadSource, '-NonInteractive') `
+        -RedirectStandardOutput $log -RedirectStandardError ($log + '.err') -PassThru -NoNewWindow
+
+    $code = Wait-ProcessWithProgress -Process $proc -Label '安装 AstrBot（官方脚本）' -TimeoutSec 900 -LogPath $log
+    if ($code -eq -2) {
+        Fail 'AstrBot 安装超过 15 分钟没动静' ("日志：" + $log + "`n先跑一次 -Action Check 看装到哪一步了。")
     }
+    if ($code -lt 0 -and -not (Get-AstrBotCli)) {
+        # 退出码读不到，且也没装出来：按失败处理，但把话说明白
+        $tail = ''
+        if (Test-Path $log) { $tail = ((Read-LogTail -Path $log -Lines 12) -join "`n") }
+        Fail 'AstrBot 安装脚本跑完了，但既读不到退出码、也没找到 astrbot 命令' ("日志末尾：`n" + $tail)
+    }
+    if ($code -gt 0) {
+        $tail = ''
+        if (Test-Path $log) { $tail = ((Read-LogTail -Path $log -Lines 12) -join "`n") }
+        Fail ('AstrBot 安装脚本返回错误码 ' + $code) ("1) 看下面日志末尾`n2) 换网络重试（手机热点最省事）`n3) 别加 -DownloadSource official：国内那条路更差`n`n日志末尾：`n" + $tail)
+    }
+}
+
+function Install-AstrBot {
+    Step '2.1' '部署 AstrBot'
+
     Warn '安装期间窗口关闭按钮会失效（防误关）；真要中止，连按两次 Ctrl+C'
     Set-CloseButton $false
     Write-RunMarker '安装 AstrBot'
-    $log = Join-Path $script:LogDir ('astrbot-install-{0}.log' -f (Get-Date -Format 'HHmmss'))
-
     try {
-        $proc = Start-Process -FilePath 'powershell.exe' `
-            -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $ps1, '-Language', 'zh-CN', '-DownloadSource', $DownloadSource, '-NonInteractive') `
-            -RedirectStandardOutput $log -RedirectStandardError ($log + '.err') -PassThru -NoNewWindow
+        Info '路线 A：PyPI 镜像直装（uv wheel + Python 3.12 + astrbot，全程不碰 GitHub）'
+        $okA = $false
+        try { $okA = Install-AstrBotViaUv } catch { Warn ('路线 A 出错：' + $_.Exception.Message) }
 
-        $code = Wait-ProcessWithProgress -Process $proc -Label '安装 AstrBot' -TimeoutSec 900 -LogPath $log
-        if ($code -eq -2) {
-            Fail 'AstrBot 安装超过 15 分钟没动静' ("多半卡在下载。日志：" + $log + "`n先跑一次 -Action Check 看装到哪一步了。")
+        if ($okA) {
+            $cli = Get-AstrBotCli
+            if ($cli) { Ok ('AstrBot 装好了：' + $cli); return }
+            Warn '装完了但没找到 astrbot 命令，换路线 B'
+        } else {
+            Warn '路线 A 没成，改走官方 install.ps1'
         }
-        if ($code -ne 0) {
-            $tail = ''
-            if (Test-Path $log) { $tail = (Get-Content $log -Tail 12 | Out-String) }
-            $extra = ''
-            if ($script:Net.ContainsKey('github') -and -not $script:Net['github']) {
-                $extra = "`n这台机器的典型死法：官方脚本先去 USTC 镜像取 uv，USTC 对大文件回 403；它再退回 GitHub，GitHub 又不通 → 直接 exit 1。`n手动绕过：换台能上网的机器跑一次 " + $script:InstallUrl + "（或手机热点），装好 uv 后回来重跑本脚本，会自动认出。"
-            }
-            Fail ('AstrBot 安装脚本返回错误码 ' + $code) ("1) 看下面日志末尾`n2) 换网络重试（手机热点最省事）`n3) 别加 -DownloadSource official：国内那条路更差" + $extra + "`n`n日志末尾：`n" + $tail)
-        }
-    } finally {
-        Set-CloseButton $true
-    }
 
-    if (-not (Get-AstrBotCli)) {
-        Fail '安装脚本说成功了，但找不到 astrbot 命令' @"
+        Install-AstrBotOfficial
+
+        if (-not (Get-AstrBotCli)) {
+            Fail '安装脚本说成功了，但找不到 astrbot 命令' @"
 PATH 可能没刷新。按顺序试：
   1) 关掉窗口重开一个 PowerShell，再跑本脚本（会自动认出）
   2) where.exe astrbot
-  3) 看日志：$log
+  3) 看日志目录：$script:LogDir
 "@
+        }
+        Ok 'AstrBot 装好了'
+    } finally {
+        Set-CloseButton $true
     }
-    Ok 'AstrBot 装好了'
 }
 
 function Resolve-AstrBot {
@@ -901,9 +1140,12 @@ function Install-NapCatOneKey {
             Fail 'NapCat 一体包安装超过 30 分钟没动静' ('看日志：' + $log + "`n多半卡在下载 QQ（300 MB）。网络差就手动跑一次安装器，完事再重跑本脚本。")
         }
         if ($code -ne 0) {
-            $tail = ''
-            if (Test-Path $log) { $tail = (Get-Content $log -Tail 12 | Out-String) }
-            Fail ('NapCat 安装器返回错误码 ' + $code) ("日志末尾：`n" + $tail)
+            # -1 = 拿不到退出码：下面会去找装好的目录，装出来了就算成功
+            if ($code -gt 0) {
+                $tail = ''
+                if (Test-Path $log) { $tail = ((Read-LogTail -Path $log -Lines 12) -join "`n") }
+                Fail ('NapCat 安装器返回错误码 ' + $code) ("日志末尾：`n" + $tail)
+            }
         }
     } finally {
         Set-CloseButton $true
