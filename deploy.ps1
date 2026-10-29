@@ -1603,6 +1603,23 @@ function Get-NapCatRunning([string]$NapCatPath) {
         Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($NapCatPath, [StringComparison]::OrdinalIgnoreCase) })
 }
 
+# NapCat 会自己开一个控制台窗口，那个窗口默认拿的是系统代码页（中文机器上是 GBK），
+# 而它打印的是 UTF-8 —— 两边对不上，中文就花屏。
+# 办法：用一个只做两件事的包装脚本启动它（chcp 65001 + 原样执行），把窗口代码页钉死。
+function Get-NapCatLauncher([string]$NapCatPath) {
+    $boot = Join-Path $NapCatPath 'NapCatWinBootMain.exe'
+    if (-not (Test-Path $boot)) { return $boot }
+
+    $wrapper = Join-Path $NapCatPath 'start-napcat-utf8.cmd'
+    try {
+        $content = "@echo off`r`nchcp 65001 >nul`r`ncd /d `"%~dp0`"`r`n`"%~dp0NapCatWinBootMain.exe`"`r`n"
+        [System.IO.File]::WriteAllText($wrapper, $content, (New-Object System.Text.ASCIIEncoding))
+        return $wrapper
+    } catch {
+        return $boot
+    }
+}
+
 # 让 NapCat 下次启动时自动登录这个号（webui.json 里的 autoLoginAccount）。
 # 目的：扫一次码拿到号之后，重启不必再扫第二次。
 function Set-NapCatAutoLogin([string]$NapCatPath, [string]$QQNumber) {
@@ -1643,10 +1660,10 @@ function Restart-NapCat([string]$NapCatPath) {
     }
 
     # 停了就要拉起来，不然配置写完了也没人读
-    $boot = Join-Path $NapCatPath 'NapCatWinBootMain.exe'
-    if (-not (Test-Path $boot)) { return $false }
+    $launcher = Get-NapCatLauncher $NapCatPath
+    if (-not (Test-Path $launcher)) { return $false }
     try {
-        Start-Process -FilePath $boot -WorkingDirectory $NapCatPath | Out-Null
+        Start-Process -FilePath $launcher -WorkingDirectory $NapCatPath | Out-Null
     } catch {
         Warn ('NapCat 拉不起来：' + $_.Exception.Message)
         return $false
@@ -1862,7 +1879,8 @@ function Start-NapCat([string]$NapCatPath, [string]$ExpectQQ, [int]$Port, [switc
         }
 
         try {
-            Start-Process -FilePath $boot -WorkingDirectory $NapCatPath | Out-Null
+            $launcher = Get-NapCatLauncher $NapCatPath
+            Start-Process -FilePath $launcher -WorkingDirectory $NapCatPath | Out-Null
             Ok 'NapCat 已启动（会拉起 QQ 登录窗口，别关它）'
         } catch {
             Fail 'NapCat 启动失败' ('错误：' + $_.Exception.Message + '`n路径：' + $boot + '`n可能是杀软拦了，把整个 NapCat 目录加白名单再试。')

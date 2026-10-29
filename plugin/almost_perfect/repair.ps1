@@ -57,7 +57,15 @@ $qr = Get-ChildItem $NapCatDir -Recurse -Filter 'qrcode.png' -ErrorAction Silent
 if ($qr) { $qrBefore = $qr.LastWriteTime }
 
 try {
-    Start-Process -FilePath $boot -WorkingDirectory $NapCatDir | Out-Null
+    # 用包装脚本启动，把 NapCat 那个控制台窗口的代码页钉成 UTF-8，避免中文花屏
+    $wrapper = Join-Path $NapCatDir 'start-napcat-utf8.cmd'
+    $content = "@echo off`r`nchcp 65001 >nul`r`ncd /d `"%~dp0`"`r`n`"%~dp0NapCatWinBootMain.exe`"`r`n"
+    $launchTarget = $boot
+    try {
+        [System.IO.File]::WriteAllText($wrapper, $content, (New-Object System.Text.ASCIIEncoding))
+        if (Test-Path $wrapper) { $launchTarget = $wrapper }
+    } catch { }
+    Start-Process -FilePath $launchTarget -WorkingDirectory $NapCatDir | Out-Null
     Write-Log '已拉起 NapCat，等它自动登录并连回来'
 } catch {
     Write-Log ("启动失败：" + $_.Exception.Message)
