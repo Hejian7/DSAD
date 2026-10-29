@@ -45,6 +45,7 @@ param(
     [switch]$KeepNapCatRunning,
     [switch]$InstallWatchdog,
     [switch]$SkipNetworkCheck,
+    [switch]$Preflight,
     [switch]$Uninstall,
     [switch]$Quiet
 )
@@ -69,6 +70,7 @@ $script:GuardLoaded = $false
 $script:CurrentStage = ''
 $script:MarkerFile = Join-Path $script:Root '.install-in-progress.json'
 $script:LockFile = Join-Path $script:Root '.deploy.lock'
+$script:NapCatCache = $null
 
 # 双击两次是最常见的人为事故：两个部署同时改同一份配置，最后谁对谁错说不清
 function Enter-DeployLock {
@@ -200,58 +202,114 @@ function Test-Endpoint([string]$Url, [int]$TimeoutSec = 5, [switch]$Head, [switc
     }
 }
 
-# 联网预检：先把“哪条路通”问清楚，再决定后面怎么下载
-function Test-NetworkProfile {
-    Step '1.1' '联网预检（每条路 5 秒超时，最多几十秒）'
+# 本地清点：先看这台机器上已经有什么。后面要不要下载、要探哪些站点，全看它。
+function Get-LocalInventory {
+    Step '1.1' '清点本地已有的东西'
+
+    $inv = [pscustomobject]@{ Uv = $null; Python312 = $null; AstrBot = $null; NapCat = $null; Qq = $null }
+
+    $inv.Uv = Get-UvOnPath
+    if ($inv.Uv) { Ok ('uv：已装 ' + $inv.Uv) }
+    else { Info 'uv：没有 —— 要用的话从 PyPI 镜像取 wheel（约 20 MB）' }
+
+    $inv.Python312 = Get-Python312Path
+    if ($inv.Python312) { Ok ('Python 3.12：已装 ' + $inv.Python312) }
+    else { Info 'Python 3.12：没有 —— 需要时装官方包（约 27 MB）' }
+
+    $ab = Resolve-AstrBotExisting
+    $inv.AstrBot = $ab
+    if ($ab) { Ok ('AstrBot：已装（' + $ab.Kind + '）' + $ab.Root) }
+    else { Info 'AstrBot：没装 —— 走 PyPI 镜像直装，不碰 GitHub' }
+
+    $nap = Find-NapCat -ExistingOnly
+    $inv.NapCat = $nap
+    if ($nap) { $script:NapCatCache = $nap; Ok ('NapCat：已有 ' + $nap) }
+    else { Info 'NapCat：没有 —— 要下一体包（约 34 MB，外加 QQ 客户端 300 MB）' }
+
+    $qq = Get-QqClientInfo
+    $inv.Qq = $qq
+    if ($qq) { Ok ('QQ 客户端：' + $qq.Version + ' @ ' + $qq.Root) }
+    else { Info 'QQ 客户端：没检测到（用一体包会自带，不用管）' }
+
+    return $inv
+}
+
+# 联网预检：只探「这次真的要下载的那几样」，本地已经有的完全不浪费时间
+function Test-NetworkProfile($Inventory) {
+    Step '1.2' '联网预检（只查这次要用到的源，每项 3 秒超时）'
     Set-WindowTitle '联网预检'
 
-    $targets = @(
-        [pscustomobject]@{ Key = 'astrbot'; Name = 'AstrBot 文档站'; Url = 'https://docs.astrbot.app/install.ps1'; Must = $true },
-        [pscustomobject]@{ Key = 'pypi_tuna'; Name = '清华 PyPI'; Url = 'https://pypi.tuna.tsinghua.edu.cn/simple/uv/'; Must = $true },
-        [pscustomobject]@{ Key = 'pypi_ali'; Name = '阿里 PyPI'; Url = 'https://mirrors.aliyun.com/pypi/simple/uv/'; Must = $false },
-        [pscustomobject]@{ Key = 'pypi_cernet'; Name = 'cernet PyPI'; Url = 'https://mirrors.cernet.edu.cn/pypi/web/simple/uv/'; Must = $false },
-        [pscustomobject]@{ Key = 'python'; Name = 'npmmirror Py3.12'; Url = 'https://registry.npmmirror.com/-/binary/python/3.12.10/python-3.12.10-amd64.exe'; Must = $false },
-        [pscustomobject]@{ Key = 'github'; Name = 'GitHub 直连'; Url = 'https://github.com'; Must = $false },
-        [pscustomobject]@{ Key = 'ghproxy'; Name = 'ghproxy 镜像'; Url = 'https://ghproxy.net'; Must = $false }
-    )
+    $needPypi = $false
+    $needPython = $false
+    $needNapCat = $false
 
-    $i = 0
-    foreach ($t in $targets) {
-        $i++
-        $r = Test-Endpoint -Url $t.Url -TimeoutSec 5 -Head
+    if (-not $Inventory.AstrBot) {
+        $needPypi = $true
+        if (-not $Inventory.Python312) { $needPython = $true }
+    }
+    if (-not $Inventory.NapCat) { $needNapCat = $true }
+
+    $script:Net = @{}
+    $script:Net['pypi_any'] = $true
+
+    if (-not $needPypi -and -not $needPython -and -not $needNapCat) {
+        Ok '本地该有的都有，这次一个字节都不用下，跳过联网预检'
+        return
+    }
+
+    $probes = @()
+    if ($needPypi) {
+        $probes += [pscustomobject]@{ Key = 'pypi_tuna'; Name = '清华 PyPI'; Url = 'https://pypi.tuna.tsinghua.edu.cn/simple/uv/' }
+    }
+    if ($needPython) {
+        $probes += [pscustomobject]@{ Key = 'python'; Name = 'npmmirror Py3.12'; Url = 'https://registry.npmmirror.com/-/binary/python/3.12.10/python-3.12.10-amd64.exe' }
+    }
+    if ($needNapCat) {
+        $probes += [pscustomobject]@{ Key = 'github'; Name = 'GitHub 直连'; Url = 'https://github.com' }
+        $probes += [pscustomobject]@{ Key = 'ghproxy'; Name = 'ghproxy 镜像'; Url = 'https://ghproxy.net' }
+    }
+
+    $pypiFallbackTried = $false
+    foreach ($t in $probes) {
+        $r = Test-Endpoint -Url $t.Url -TimeoutSec 3 -Head
         $script:Net[$t.Key] = $r.Ok
         if ($r.Ok) {
             Say ("    √ {0,-16} {1,5} ms" -f $t.Name, $r.Ms) 'Green'
         } else {
-            $tag = ''
-            if ($t.Must) { $tag = '（这条必须通）' }
-            Say ("    ! {0,-16} 不通 {1}" -f $t.Name, $tag) 'Yellow'
+            Say ("    ! {0,-16} 不通" -f $t.Name) 'Yellow'
+            # 主选挂了才试备选，不预先把备选全打一遍
+            if ($t.Key -eq 'pypi_tuna' -and -not $pypiFallbackTried) {
+                $pypiFallbackTried = $true
+                foreach ($b in @(
+                        [pscustomobject]@{ Name = '阿里 PyPI'; Url = 'https://mirrors.aliyun.com/pypi/simple/uv/' },
+                        [pscustomobject]@{ Name = 'cernet PyPI'; Url = 'https://mirrors.cernet.edu.cn/pypi/web/simple/uv/' }
+                    )) {
+                    $rb = Test-Endpoint -Url $b.Url -TimeoutSec 3 -Head
+                    if ($rb.Ok) {
+                        Say ("    √ {0,-16} {1,5} ms（备选）" -f $b.Name, $rb.Ms) 'Green'
+                        $script:Net['pypi_tuna'] = $true
+                        break
+                    }
+                    Say ("    ! {0,-16} 不通" -f $b.Name) 'Yellow'
+                }
+            }
         }
     }
 
-    $pypiOk = $script:Net['pypi_tuna'] -or $script:Net['pypi_ali'] -or $script:Net['pypi_cernet']
-    $script:Net['pypi_any'] = [bool]$pypiOk
-
-    Say ''
-    if ($pypiOk -and $script:Net['astrbot']) {
-        Ok '基础网络可用：PyPI 镜像与文档站都在'
-    } elseif ($pypiOk) {
-        Warn 'PyPI 镜像通，但 AstrBot 文档站不通 —— 官方安装脚本可能取不到'
-    } else {
-        Fail '一个 PyPI 镜像都不通，装不了 AstrBot' @"
-三条都试过了：清华、阿里、cernet。这通常意味着：
-  1) 机器根本没联网（先浏览器打开任意网页试试）
+    if ($needPypi -and -not $script:Net['pypi_tuna']) {
+        Fail 'PyPI 镜像一个都连不上，装不了 AstrBot' @"
+清华、阿里、cernet 都试过了。通常意味着：
+  1) 机器根本没联网（先浏览器随便打开一个网页试试）
   2) 公司/校园网要认证或走代理（设好代理后重跑，脚本会自动识别系统代理）
   3) DNS 坏了：换 223.5.5.5 / 119.29.29.29 再试
 实在不行，手机开热点给这台机器跑一次。
 "@
     }
-
-    if (-not $script:Net['github']) {
-        Warn 'GitHub 直连不通 —— NapCat 会走 ghproxy 镜像；官方 install.ps1 里的 uv 下载也会失败'
-        if (-not $script:Net['ghproxy']) { Warn 'ghproxy 也不通：NapCat 大概率装不上，需要手动放安装包（脚本会告诉你放哪）' }
-    } else {
-        Ok 'GitHub 直连可用'
+    if ($needPython -and -not $script:Net['python']) {
+        Warn 'npmmirror 连不上：装 Python 3.12 那步可能很慢或者失败'
+    }
+    if ($needNapCat -and -not $script:Net['github'] -and -not $script:Net['ghproxy']) {
+        Warn 'NapCat 直连和 ghproxy 都不通：到时候会提示你手动放安装包'
     }
 }
 
@@ -1205,7 +1263,15 @@ function Install-NapCatOneKey {
 }
 
 function Find-NapCat {
-    Step 3 '定位 NapCat'
+    param([switch]$ExistingOnly)
+
+    if (-not $ExistingOnly) { Step 3 '定位 NapCat' }
+
+    # 清点时已经找到过，别为了同一件事把桌面和下载目录再扫一遍
+    if (-not $NapCatDir -and $script:NapCatCache -and (Test-NapCatRoot $script:NapCatCache)) {
+        if (-not $ExistingOnly) { Ok ('使用已定位的 NapCat：' + $script:NapCatCache) }
+        return $script:NapCatCache
+    }
 
     if ($NapCatDir) {
         if (Test-NapCatRoot $NapCatDir) { Ok ('使用指定目录：' + $NapCatDir); return $NapCatDir }
@@ -1218,7 +1284,10 @@ function Find-NapCat {
             Where-Object { $_.Name -match '^NapCat\.[\d.]+\.Shell$' } |
             Where-Object { Test-Path (Join-Path $_.FullName 'NapCatWinBootMain.exe') } |
             Sort-Object LastWriteTime -Descending)
-        if ($ready.Count -gt 0) { Ok ('使用已装好的一体包：' + $ready[0].FullName); return $ready[0].FullName }
+        if ($ready.Count -gt 0) {
+            if (-not $ExistingOnly) { Ok ('使用已装好的一体包：' + $ready[0].FullName) }
+            return $ready[0].FullName
+        }
     }
 
     # 用户机器上已有的 NapCat（桌面/下载目录），能直接用就用
@@ -1246,10 +1315,15 @@ function Find-NapCat {
             })
             $pick = ($scored | Sort-Object Score -Descending)[0].Path
         }
-        Ok ('找到现成的 NapCat：' + $pick)
-        Info '如果要改用它自带的 QQ/NapCat，删掉这个目录或加 -NapCatDir 指定别的。'
+        if (-not $ExistingOnly) {
+            Ok ('找到现成的 NapCat：' + $pick)
+            Info '如果要改用它自带的 QQ/NapCat，删掉这个目录或加 -NapCatDir 指定别的。'
+        }
         return $pick
     }
+
+    # 只是清点家底时到此为止，绝不触发下载
+    if ($ExistingOnly) { return $null }
 
     if ($NapCatMode -eq 'shell') {
         Warn '按 -NapCatMode shell：下载不带 QQ 的 NapCat（需要客户机器已有 QQ）'
@@ -1654,7 +1728,8 @@ function Assert-Environment {
     if ($free -lt 3) { Fail ('磁盘剩余空间不足（' + $free + ' GB）') '至少留 3 GB：Python 3.12 + astrbot + NapCat + 日志。' }
     Ok ('磁盘剩余 ' + $free + ' GB')
 
-    if (-not $SkipNetworkCheck) { Test-NetworkProfile }
+    $inv = Get-LocalInventory
+    if (-not $SkipNetworkCheck) { Test-NetworkProfile -Inventory $inv }
     else { Warn '按 -SkipNetworkCheck 跳过联网预检：下面哪步下载失败，别怪提示不早说' }
 
     if (-not (Test-IsAdmin)) { Warn '不是管理员：QQ 装在 Program Files 时 NapCat 注入可能失败，登不上就用管理员重跑。' }
@@ -1827,10 +1902,10 @@ try {
     if ($Uninstall) { Remove-Deployment; exit 0 }
 
     # 双击两次会起两个部署，互相覆盖配置——直接拦下
-    if ($Action -eq 'Deploy' -and -not $Probe -and -not $SelfCheck) { Enter-DeployLock }
+    if ($Action -eq 'Deploy' -and -not $Probe -and -not $SelfCheck -and -not $Preflight) { Enter-DeployLock }
 
     # 上次没跑完？先把话说清楚，别让客户对着“装一半”犯迷糊
-    if ($Action -eq 'Deploy' -and -not $Probe -and -not $SelfCheck) {
+    if ($Action -eq 'Deploy' -and -not $Probe -and -not $SelfCheck -and -not $Preflight) {
         $prev = Get-PreviousRun
         if ($prev) {
             Say ''
@@ -1879,6 +1954,13 @@ try {
     }
 
     Assert-Environment
+
+    if ($Preflight) {
+        Say ''
+        Say '预检结束：该有的有、该通的通，就可以正式部署了。' 'Green'
+        Say '（这一步没有改动任何文件；去掉 -Preflight 才是真部署）' 'DarkGray'
+        exit 0
+    }
 
     $ab = Resolve-AstrBot
     Initialize-AstrBotWorkdir $ab
