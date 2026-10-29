@@ -1570,15 +1570,17 @@ function Get-Pbkdf2Hash([string]$Password, [int]$Iterations = 600000) {
 function Save-PanelCredentials([string]$Path, [string]$Password, [string]$NapCatUrl) {
     try {
         $lines = @(
-            'DSH-QQ 一键部署 —— 面板登录信息',
+            'DSH-QQ 一键部署 —— 面板登录信息（照下面填就行）',
             ('生成时间：' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')),
             '',
-            ('NapCat 面板：' + $NapCatUrl),
-            ('  登录令牌（token）：' + $Password),
+            '=== AstrBot 面板（有用户名和密码两栏）===',
+            '地址：http://127.0.0.1:6185',
+            '用户名一栏填：astrbot',
+            ('密码一栏填：  ' + $Password),
             '',
-            'AstrBot 面板：http://127.0.0.1:6185',
-            '  用户名：astrbot',
-            ('  密码：' + $Password),
+            '=== NapCat 面板（只有令牌一栏）===',
+            ('地址：' + $NapCatUrl),
+            ('令牌（token）一栏填：' + $Password),
             '',
             '（两个都是本机服务；想换密码就重新跑一次部署脚本）'
         )
@@ -2419,12 +2421,16 @@ try {
     Say ''
     Say ('   机器人 QQ：' + $QQ)
     Say ''
-    Say ('   NapCat 面板：' + $napUrl)
-    Say ('   登录令牌：' + $panelPw) 'Yellow'
+    Say '   ┌─ 登录 AstrBot 面板（照这个填）──────────────' 'Cyan'
+    Say '   │  地址：http://127.0.0.1:6185'
+    Say '   │  用户名一栏填：astrbot' 'Yellow'
+    Say ('   │  密码一栏填：  ' + $panelPw) 'Yellow'
+    Say '   └─────────────────────────────────────────────' 'Cyan'
     Say ''
-    Say '   AstrBot 面板：http://127.0.0.1:6185'
-    Say '   用户名：astrbot'
-    Say ('   密码：' + $panelPw) 'Yellow'
+    Say '   ┌─ 登录 NapCat 面板 ──────────────────────────' 'Cyan'
+    Say ('   │  地址：' + $napUrl)
+    Say ('   │  令牌（token）一栏填：' + $panelPw) 'Yellow'
+    Say '   └─────────────────────────────────────────────' 'Cyan'
     Say ''
     if ($panelPw) { Say ('   这些都存了一份：' + $credFile) 'DarkGray' }
     Say ('   日志目录：' + $script:LogDir) 'DarkGray'
@@ -2432,6 +2438,8 @@ try {
     Say '   正在帮你打开两个面板（没弹出就点上面的地址）……' 'DarkGray'
     if ($webNap) { Open-Panel $napUrl 'NapCat 面板' }
     Open-Panel 'http://127.0.0.1:6185' 'AstrBot 面板'
+    Say ''
+    Say ('   AstrBot 登录提醒：用户名填 astrbot，密码填 ' + $panelPw) 'Yellow'
     Say ''
     Say '   接下来：用手机 QQ 给这个机器人发一句话试试（群里要先 @ 它）。' 'White'
     Say '   日常用「启动.cmd / 停止.cmd / 状态.cmd」，不用再跑这个部署脚本。' 'DarkGray'
