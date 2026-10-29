@@ -1147,8 +1147,20 @@ function Set-AstrBotConfig($Target, [string]$QQNumber, [string]$Key, [switch]$Gr
         Ok 'Agent 执行权限保持关闭（群聊不需要，也不该给）'
     }
 
+    # 面板密码：直接给客户设一个已知的，两个面板共用
+    $panelPw = New-PanelPassword
+    if (-not $cfg.dashboard) { $cfg | Add-Member -NotePropertyName dashboard -NotePropertyValue ([pscustomobject]@{}) -Force }
+    Set-Prop $cfg.dashboard 'enable' $true
+    Set-Prop $cfg.dashboard 'username' 'astrbot'
+    Set-Prop $cfg.dashboard 'password' (Get-Md5Hex $panelPw)
+    Set-Prop $cfg.dashboard 'pbkdf2_password' (Get-Pbkdf2Hash $panelPw)
+    Set-Prop $cfg.dashboard 'password_storage_upgraded' $true
+    Set-Prop $cfg.dashboard 'password_change_required' $false
+    $script:PanelPassword = $panelPw
+    Ok ('面板密码已设置：' + $panelPw)
+
     Write-Json $Target.Config $cfg
-    return [pscustomobject]@{ Port = $obPort; Token = $obToken; Changed = $changed }
+    return [pscustomobject]@{ Port = $obPort; Token = $obToken; Changed = $changed; PanelPassword = $panelPw }
 }
 
 # ── NapCat：识别 / 配置 / 启动 ─────────────────────────────────────────────
@@ -1496,9 +1508,82 @@ function Set-NapCatConfig([string]$NapCatPath, [string]$QQNumber, [int]$Port, [s
 
     Write-Json $target $store
 
+    # NapCat 面板密码跟着 AstrBot 走（webui.json 里是明文 token）
+    if ($script:PanelPassword -and $cfgDir) {
+        $webFile = Join-Path $cfgDir 'webui.json'
+        if (Test-Path $webFile) {
+            try {
+                Backup-File $webFile
+                $wj = Read-Json $webFile
+                Set-Prop $wj 'token' $script:PanelPassword
+                Write-Json $webFile $wj
+                Ok 'NapCat 面板密码已同步'
+            } catch {
+                Warn ('改 NapCat 面板密码失败：' + $_.Exception.Message)
+            }
+        }
+    }
+
     Ok ('已启用客户端：' + $mine.url)
     Ok '端口与 token 都和 AstrBot 一致'
     Ok ('本地测试接口：http://127.0.0.1:' + $script:TestApiPort)
+}
+
+# ── 面板密码 ──────────────────────────────────────────────────────────────
+# AstrBot 的面板密码存成 pbkdf2_sha256$600000$盐$摘要（盐、摘要都是 hex），
+# 校验逻辑见 astrbot/core/utils/auth_password.py；MD5 是历史兼容格式。
+# NapCat 的 WebUI 用明文 token。两边统一成脚本生成的一个密码，省得客户去翻。
+function New-PanelPassword {
+    $u = 'ABCDEFGHJKLMNPQRSTUVWXYZ'
+    $l = 'abcdefghijkmnpqrstuvwxyz'
+    $d = '23456789'
+    $all = $u + $l + $d
+    for ($try = 0; $try -lt 20; $try++) {
+        $chars = @()
+        for ($i = 0; $i -lt 10; $i++) { $chars += [string]$all[(Get-Random -Maximum $all.Length)] }
+        $pw = -join $chars
+        if ($pw -cmatch '[A-Z]' -and $pw -cmatch '[a-z]' -and $pw -match '\d') { return ('Dsh' + $pw) }
+    }
+    return 'DshAstrBot2026'
+}
+
+function Get-Md5Hex([string]$Text) {
+    $md5 = [System.Security.Cryptography.MD5]::Create()
+    try {
+        $bytes = $md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Text))
+    } finally { $md5.Dispose() }
+    return (($bytes | ForEach-Object { $_.ToString('x2') }) -join '')
+}
+
+function Get-Pbkdf2Hash([string]$Password, [int]$Iterations = 600000) {
+    $salt = New-Object byte[] 16
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    $rng.GetBytes($salt)
+    $rng.Dispose()
+    $kdf = New-Object System.Security.Cryptography.Rfc2898DeriveBytes($Password, $salt, $Iterations, [System.Security.Cryptography.HashAlgorithmName]::SHA256)
+    $key = $kdf.GetBytes(32)
+    $saltHex = (($salt | ForEach-Object { $_.ToString('x2') }) -join '')
+    $keyHex = (($key | ForEach-Object { $_.ToString('x2') }) -join '')
+    return ('pbkdf2_sha256$' + $Iterations + '$' + $saltHex + '$' + $keyHex)
+}
+
+function Save-PanelCredentials([string]$Path, [string]$Password, [string]$NapCatUrl) {
+    try {
+        $lines = @(
+            'DSH-QQ 一键部署 —— 面板登录信息',
+            ('生成时间：' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')),
+            '',
+            ('NapCat 面板：' + $NapCatUrl),
+            ('  登录令牌（token）：' + $Password),
+            '',
+            'AstrBot 面板：http://127.0.0.1:6185',
+            '  用户名：astrbot',
+            ('  密码：' + $Password),
+            '',
+            '（两个都是本机服务；想换密码就重新跑一次部署脚本）'
+        )
+        [IO.File]::WriteAllText($Path, ($lines -join "`r`n"), (New-Object System.Text.UTF8Encoding($true)))
+    } catch { }
 }
 
 function Get-NapCatRunning([string]$NapCatPath) {
@@ -2316,20 +2401,36 @@ try {
     # 自检消息：让机器人主动给主人发一条，客户立刻能看到“活的”
     Invoke-TestMessage $ob.Token $QQ
 
-    # 配置完成 → 打开两个面板
+    # 配置完成 → 报密码 → 打开两个面板
     $webNap = Get-NapCatWebUi $napRoot
+    $panelPw = $script:PanelPassword
+    $napUrl = 'http://127.0.0.1:6099'
+    if ($webNap) {
+        $napUrl = $webNap.Url
+        if ($webNap.Token) { $panelPw = $webNap.Token }
+    }
+    $credFile = Join-Path $script:Root '面板密码.txt'
+    if ($panelPw) { Save-PanelCredentials $credFile $panelPw $napUrl }
+
     Say ''
     Say '  ============================================================' 'Green'
     Say '   配置完成 ✔' 'Green'
     Say '  ============================================================' 'Green'
     Say ''
     Say ('   机器人 QQ：' + $QQ)
-    if ($webNap) { Say ('   NapCat 面板：' + $webNap.Url + '   （token：' + $webNap.Token + '）') }
+    Say ''
+    Say ('   NapCat 面板：' + $napUrl)
+    Say ('   登录令牌：' + $panelPw) 'Yellow'
+    Say ''
     Say '   AstrBot 面板：http://127.0.0.1:6185'
-    Say ('   日志目录：' + $script:LogDir)
+    Say '   用户名：astrbot'
+    Say ('   密码：' + $panelPw) 'Yellow'
+    Say ''
+    if ($panelPw) { Say ('   这些都存了一份：' + $credFile) 'DarkGray' }
+    Say ('   日志目录：' + $script:LogDir) 'DarkGray'
     Say ''
     Say '   正在帮你打开两个面板（没弹出就点上面的地址）……' 'DarkGray'
-    if ($webNap) { Open-Panel $webNap.Url 'NapCat 面板' }
+    if ($webNap) { Open-Panel $napUrl 'NapCat 面板' }
     Open-Panel 'http://127.0.0.1:6185' 'AstrBot 面板'
     Say ''
     Say '   接下来：用手机 QQ 给这个机器人发一句话试试（群里要先 @ 它）。' 'White'
