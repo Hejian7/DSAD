@@ -96,6 +96,32 @@ ds-as-nap\
 > 路径里有空格（比如 `A:\true porject\`）会让外部命令的参数被劈开。
 > 脚本里所有传给 `Start-Process` 的路径参数都已经显式加了引号，改的时候别漏。
 
+## 卸载
+
+双击 `卸载.cmd`，会出一个菜单：
+
+```
+   1) 只删 AstrBot（本体 + 配置 + 插件都在里面）
+   2) 只删 NapCat（含它自带的那份 QQ）
+   3) 只删看门狗插件 Almost perfect
+   4) 全删（AstrBot + NapCat + 插件 + 日志缓存，以及历史遗留）
+   0) 退出
+```
+
+删除前会先停掉相关进程、列出每一项的路径和体积，再问一次确认。
+
+也可以带参数跑：
+
+```powershell
+.\uninstall.ps1 -Target all -DryRun   # 只看会删什么，不动手
+.\uninstall.ps1 -Target plugin        # 只删插件
+.\uninstall.ps1 -Target all -Yes      # 全删，不确认
+```
+
+它只删本部署装出来的东西，**不动你自己的 QQ 客户端**。
+全删时还会顺手把 `DSH-QQ-Watchdog` 计划任务清掉，并把老版本散落在用户目录的残留
+（`%LOCALAPPDATA%\dsh-qq-deploy`、`%APPDATA%\uv\tools\astrbot`、桌面上的 NapCat 一体包等）一并清掉。
+
 ## 仓库结构
 
 ```
