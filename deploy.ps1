@@ -4,7 +4,7 @@
 .DESCRIPTION
     全程脚本，不开 GUI：
       1) 检查环境
-      2) 没装 AstrBot 就跑官方脚本部署（uv tool install，中国大陆镜像）
+      2) 没装 AstrBot 就在 ds-as-nap\astrbot 里建独立环境装（PyPI 镜像，不走 GitHub）
       3) 建工作目录、astrbot init、写 OneBot 平台（端口 + token）、模型、管理员
       4) astrbot run 起服务，等 6199 端口
       5) 定位 NapCat，把它那条反向 WS 客户端指向这台 AstrBot
@@ -12,7 +12,7 @@
       7) 自检 + 可选守护任务
 .NOTES
     AstrBot 的两种形态都认：
-      · CLI 安装（uv tool install astrbot）—— 工作目录里 data\cmd_config.json
+      · CLI 安装（ds-as-nap\astrbot\.venv）—— 工作目录里 data\cmd_config.json
       · 启动器安装 —— 实例目录里 core\data\cmd_config.json
     重复运行安全：已有端口/token 一律沿用。
 .EXAMPLE
@@ -56,10 +56,27 @@ $ProgressPreference = 'SilentlyContinue'
 
 # ── 常量 ───────────────────────────────────────────────────────────────────
 $script:AppName = 'DSH-QQ 一键部署'
-$script:Root = Join-Path $env:LOCALAPPDATA 'dsh-qq-deploy'
+
+# 所有东西都装在脚本旁边的 ds-as-nap\ 里，不散落到用户目录：
+#   ds-as-nap\astrbot\   AstrBot 本体（独立 venv）+ data
+#   ds-as-nap\napcat\    NapCat 一体包
+#   ds-as-nap\python\    Python 3.12（只给 AstrBot 用）
+#   ds-as-nap\uv\        uv 单个可执行文件
+#   ds-as-nap\logs\      日志
+$script:AsRoot = Join-Path $PSScriptRoot 'ds-as-nap'
+if (-not $PSScriptRoot) { $script:AsRoot = Join-Path (Get-Location).Path 'ds-as-nap' }
+$script:AbDir = Join-Path $script:AsRoot 'astrbot'
+$script:NcDir = Join-Path $script:AsRoot 'napcat'
+$script:PyDir = Join-Path $script:AsRoot 'python'
+$script:UvDir = Join-Path $script:AsRoot 'uv'
+$script:Root = $script:AsRoot
 $script:LogDir = Join-Path $script:Root 'logs'
 $script:LogFile = Join-Path $script:LogDir ('deploy-{0}.log' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
 $script:InstallUrl = 'https://docs.astrbot.app/install.ps1'
+
+# uv 默认把下载缓存放到 %LOCALAPPDATA%\uv\cache；钉到这里，别散出去
+$env:UV_CACHE_DIR = Join-Path $script:AsRoot 'uv-cache'
+if (-not (Test-Path $env:UV_CACHE_DIR)) { New-Item -ItemType Directory -Path $env:UV_CACHE_DIR -Force -ErrorAction SilentlyContinue | Out-Null }
 
 # ── 联网 / 进度 / 中断保护 ────────────────────────────────────────────────
 $script:ProxyUrl = $null
@@ -675,6 +692,10 @@ function Get-LauncherInstances {
 }
 
 function Get-AstrBotCli {
+    # 自家装的优先：ds-as-nap\astrbot\.venv\Scripts\astrbot.exe
+    $own = Join-Path $script:AbDir '.venv\Scripts\astrbot.exe'
+    if (Test-Path $own) { return $own }
+
     $cmd = Get-Command 'astrbot' -ErrorAction SilentlyContinue
     if ($cmd -and $cmd.Source) { return $cmd.Source }
 
@@ -724,14 +745,16 @@ function Add-PathEntry([string]$Dir) {
 }
 
 function Get-UvOnPath {
-    $c = Get-Command 'uv' -ErrorAction SilentlyContinue
-    if ($c -and $c.Source) { return $c.Source }
+    # 自家目录优先，其次才找系统里已有的
     foreach ($p in @(
+            (Join-Path $script:UvDir 'uv.exe'),
             (Join-Path $env:USERPROFILE '.local\bin\uv.exe'),
             (Join-Path $env:LOCALAPPDATA 'uv\uv.exe')
         )) {
-        if (Test-Path $p) { return $p }
+        if ($p -and (Test-Path $p)) { return $p }
     }
+    $c = Get-Command 'uv' -ErrorAction SilentlyContinue
+    if ($c -and $c.Source) { return $c.Source }
     return $null
 }
 
@@ -755,7 +778,7 @@ function Ensure-Uv {
     }
 
     Info '没有 uv：从 PyPI 镜像取 wheel（约 20 MB，不走 GitHub）'
-    $binDir = Join-Path $env:USERPROFILE '.local\bin'
+    $binDir = $script:UvDir
     if (-not (Test-Path $binDir)) { New-Item -ItemType Directory -Path $binDir -Force | Out-Null }
 
     $indexes = @(
@@ -795,11 +818,19 @@ function Ensure-Uv {
 }
 
 function Get-Python312Path {
+    # 自家装的优先
+    $own = Join-Path $script:PyDir 'python.exe'
+    if (Test-Path $own) { return $own }
+
+    # py launcher 里的记录可能指向已删除的目录，必须验证存在
     try {
         $lines = @(& py -0p 2>$null)
         foreach ($l in $lines) {
             $s = [string]$l
-            if ($s -match '3\.12' -and $s -match '([A-Za-z]:\\[^\r\n]*?python\.exe)') { return $matches[1] }
+            if ($s -match '3\.12' -and $s -match '([A-Za-z]:\\[^\r\n]*?python\.exe)') {
+                $cand = $matches[1]
+                if (Test-Path $cand) { return $cand }
+            }
         }
     } catch { }
     foreach ($p in @(
@@ -813,33 +844,54 @@ function Get-Python312Path {
 }
 
 function Install-Python312 {
-    Info '没有 Python 3.12：下官方安装包（npmmirror 镜像，约 27 MB）'
-    $exe = Join-Path $script:Root 'python-3.12.10-amd64.exe'
-    if (-not (Test-Path $exe)) {
+    # 不用官方安装器：它会在注册表里留 "已安装" 记录，某些机器上再跑会直接
+    # 认为装过了、什么都不做（WixBundleInstalled=1，退出码还是 0）。
+    # 改用可嵌入版 zip —— 纯解包，不写注册表，装在哪就是哪。
+    Info '没有 Python 3.12：下载可嵌入版（约 11 MB，纯解包，不写注册表）'
+
+    $zip = Join-Path $script:Root 'python-embed.zip'
+    if (-not (Test-Path $zip)) {
         $mirrors = @(
-            [pscustomobject]@{ Name = 'npmmirror'; Url = 'https://registry.npmmirror.com/-/binary/python/3.12.10/python-3.12.10-amd64.exe' },
-            [pscustomobject]@{ Name = 'python.org'; Url = 'https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe' }
+            [pscustomobject]@{ Name = 'npmmirror'; Url = 'https://registry.npmmirror.com/-/binary/python/3.12.10/python-3.12.10-embed-amd64.zip' },
+            [pscustomobject]@{ Name = 'python.org'; Url = 'https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip' }
         )
-        if (-not (Get-FileFromMirrors -Mirrors $mirrors -OutFile $exe)) { return $null }
+        if (-not (Get-FileFromMirrors -Mirrors $mirrors -OutFile $zip)) { return $null }
     } else {
-        Info ('复用安装包：' + $exe)
+        Info ('复用安装包：' + $zip)
     }
 
-    Info '静默安装 Python 3.12（仅当前用户，不动系统 PATH）'
-    $ilog = Join-Path $script:LogDir ('python312-{0}.log' -f (Get-Date -Format 'HHmmss'))
-    $p = Start-Process -FilePath $exe -PassThru -Wait -NoNewWindow `
-        -ArgumentList @('/quiet', 'InstallAllUsers=0', 'PrependPath=0', 'Include_test=0', 'Include_doc=0', 'Include_launcher=0', 'Include_pip=1') `
-        -RedirectStandardOutput $ilog -RedirectStandardError ($ilog + '.err')
-    if ($p.ExitCode -ne 0) {
-        Warn ('Python 安装器返回 ' + $p.ExitCode + '，日志：' + $ilog)
+    if (Test-Path $script:PyDir) { Remove-Item $script:PyDir -Recurse -Force -ErrorAction SilentlyContinue }
+    New-Item -ItemType Directory -Path $script:PyDir -Force | Out-Null
+    try {
+        Expand-Archive -Path $zip -DestinationPath $script:PyDir -Force
+    } catch {
+        Warn ('解包失败：' + $_.Exception.Message)
         return $null
     }
-    $py = Get-Python312Path
-    if ($py) { Ok ('Python 3.12：' + $py) } else { Warn '装完了但没找到 python.exe' }
+
+    # 可嵌入版默认不加载 site-packages，放开 import site 才能装第三方包
+    $pth = Get-ChildItem $script:PyDir -Filter '*._pth' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($pth) {
+        try {
+            $lines = Get-Content $pth.FullName
+            $fixed = $lines -replace '^#\s*import site\s*$', 'import site'
+            Set-Content -Path $pth.FullName -Value $fixed -Encoding ASCII
+        } catch {
+            Warn ('改 _pth 失败：' + $_.Exception.Message)
+        }
+    }
+
+    $py = Join-Path $script:PyDir 'python.exe'
+    if (-not (Test-Path $py)) { Warn '解包后没有 python.exe'; return $null }
+    try {
+        $ver = (& $py --version 2>&1) -join ' '
+        Ok ('Python 3.12 就位：' + $ver)
+    } catch { }
     return $py
 }
 
-# 路线 A：uv tool install，全部走 PyPI 镜像
+# 路线 A：在 ds-as-nap\astrbot 建独立 venv，走 PyPI 镜像装
+# 路线 A：在 ds-as-nap\astrbot 里建独立 venv，把 astrbot 装进去（全部走 PyPI 镜像）
 function Install-AstrBotViaUv {
     $uv = Ensure-Uv
     if (-not $uv) { Warn '拿不到 uv'; return $false }
@@ -849,26 +901,47 @@ function Install-AstrBotViaUv {
     if (-not $py) { Warn '拿不到 Python 3.12'; return $false }
     Ok ('Python 3.12：' + $py)
 
+    $venvDir = Join-Path $script:AbDir '.venv'
+    $venvPy = Join-Path $venvDir 'Scripts\python.exe'
+
+    if (-not (Test-Path $venvPy)) {
+        Info ('建独立环境：' + $venvDir)
+        $log = Join-Path $script:LogDir ('venv-{0}.log' -f (Get-Date -Format 'HHmmss'))
+        $p = Start-Process -FilePath $uv -PassThru -NoNewWindow `
+            -ArgumentList @('venv', ('"' + $venvDir + '"'), '--python', ('"' + $py + '"')) `
+            -RedirectStandardOutput $log -RedirectStandardError ($log + '.err')
+        $code = Wait-ProcessWithProgress -Process $p -Label '建 venv' -TimeoutSec 300 -LogPath $log
+        if ($code -ne 0 -and -not (Test-Path $venvPy)) {
+            Warn ('建 venv 失败（退出码 ' + $code + '）')
+            return $false
+        }
+    } else {
+        Info ('复用已有环境：' + $venvDir)
+    }
+    if (-not (Test-Path $venvPy)) { Warn 'venv 里没有 python.exe'; return $false }
+
     $indexes = @(
         'https://pypi.tuna.tsinghua.edu.cn/simple',
         'https://mirrors.aliyun.com/pypi/simple',
         'https://mirrors.cernet.edu.cn/pypi/web/simple'
     )
     foreach ($idx in $indexes) {
-        Info ('uv tool install astrbot  ←  ' + $idx)
-        $log = Join-Path $script:LogDir ('astrbot-uv-{0}.log' -f (Get-Date -Format 'HHmmss'))
+        Info ('装 astrbot 到这个环境  ←  ' + $idx)
+        $log = Join-Path $script:LogDir ('astrbot-pip-{0}.log' -f (Get-Date -Format 'HHmmss'))
         $p = Start-Process -FilePath $uv -PassThru -NoNewWindow `
-            -ArgumentList @('tool', 'install', 'astrbot', '--python', $py, '--default-index', $idx) `
+            -ArgumentList @('pip', 'install', '--python', ('"' + $venvPy + '"'), 'astrbot', '--default-index', $idx) `
             -RedirectStandardOutput $log -RedirectStandardError ($log + '.err')
-        $code = Wait-ProcessWithProgress -Process $p -Label '安装 astrbot' -TimeoutSec 1200 -LogPath $log
-        if ($code -eq 0) {
-            Ok 'uv tool install 成功'
+        $code = Wait-ProcessWithProgress -Process $p -Label '安装 astrbot' -TimeoutSec 1800 -LogPath $log
+
+        $cli = Join-Path $venvDir 'Scripts\astrbot.exe'
+        if ($code -eq 0 -and (Test-Path $cli)) {
+            Ok ('astrbot 装好了：' + $cli)
             return $true
         }
         if ($code -eq -2) { Warn '装 astrbot 超时，换下一条索引'; continue }
-        # -1 = PS 拿不到退出码：以“命令有没有装出来”为准，别把成功当失败
-        if ($code -lt 0 -and (Get-AstrBotCli)) {
-            Ok 'uv tool install 完成（退出码读不到，但 astrbot 已经就位）'
+        # -1 = PS 拿不到退出码：以“可执行文件在不在”为准
+        if ($code -lt 0 -and (Test-Path $cli)) {
+            Ok 'astrbot 装好了（退出码读不到，但文件已就位）'
             return $true
         }
         $tail = ''
@@ -898,7 +971,7 @@ function Install-AstrBotOfficial {
 
     $log = Join-Path $script:LogDir ('astrbot-install-{0}.log' -f (Get-Date -Format 'HHmmss'))
     $proc = Start-Process -FilePath 'powershell.exe' `
-        -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $ps1, '-Language', 'zh-CN', '-DownloadSource', $DownloadSource, '-NonInteractive') `
+        -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $ps1 + '"'), '-Language', 'zh-CN', '-DownloadSource', $DownloadSource, '-NonInteractive') `
         -RedirectStandardOutput $log -RedirectStandardError ($log + '.err') -PassThru -NoNewWindow
 
     $code = Wait-ProcessWithProgress -Process $proc -Label '安装 AstrBot（官方脚本）' -TimeoutSec 900 -LogPath $log
@@ -987,13 +1060,13 @@ function Resolve-AstrBot {
 
   1) 关掉这个窗口，重新开一个 PowerShell 再跑（PATH 是登录时读的）
   2) 或者手动执行：where.exe astrbot
-  3) 还不行就看日志：%LOCALAPPDATA%\dsh-qq-deploy\logs\astrbot-install-*.log
+  3) 还不行就看日志：<脚本目录>\ds-as-nap\logs\astrbot-install-*.log
 "@
     }
     Ok ('astrbot：' + $cli)
 
     $work = $WorkDir
-    if (-not $work) { $work = Join-Path $script:Root 'astrbot' }
+    if (-not $work) { $work = $script:AbDir }
     if (-not (Test-Path $work)) { New-Item -ItemType Directory -Path $work -Force | Out-Null }
     Ok ('工作目录：' + $work)
     return [pscustomobject]@{ Kind = 'cli'; Root = $work; Config = (Join-Path $work 'data\cmd_config.json'); Cli = $cli }
@@ -1207,7 +1280,7 @@ function Test-NapCatSelfContained([string]$Root) {
 function Install-NapCatOneKey {
     Step '3.1' '安装 NapCat 一体包（自带 QQ，不用客户预装）'
 
-    $base = Join-Path $script:Root 'napcat-onekey'
+    $base = $script:NcDir
     if (-not (Test-Path $base)) { New-Item -ItemType Directory -Path $base -Force | Out-Null }
 
     $zip = Join-Path $base 'NapCat.Shell.Windows.OneKey.zip'
@@ -1293,7 +1366,7 @@ function Find-NapCat {
         Fail ('指定的目录不像 NapCat 根目录：' + $NapCatDir) '要指向含 NapCatWinBootMain.exe 的那层（一体包是 NapCat.xxxxx.Shell），不是 bootmain。'
     }
 
-    $onekey = Join-Path $script:Root 'napcat-onekey'
+    $onekey = $script:NcDir
     if (Test-Path $onekey) {
         $ready = @(Get-ChildItem $onekey -Directory -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -match '^NapCat\.[\d.]+\.Shell$' } |
@@ -2052,7 +2125,7 @@ function Remove-Deployment {
     if (-not $target) {
         $found = @(Get-LauncherInstances)
         if ($found.Count -gt 0) { $target = Join-Path $found[0].FullName 'core\data\cmd_config.json' }
-        else { $target = Join-Path (Join-Path $script:Root 'astrbot') 'data\cmd_config.json' }
+        else { $target = Join-Path ($script:AbDir) 'data\cmd_config.json' }
     }
     if (Test-Path $target) {
         $bak = Get-ChildItem (Split-Path $target -Parent) -Filter 'cmd_config.json.bak-*' -ErrorAction SilentlyContinue |
@@ -2099,14 +2172,14 @@ function Resolve-AstrBotExisting {
     $cli = Get-AstrBotCli
     if ($cli) {
         $work = $WorkDir
-        if (-not $work) { $work = Join-Path $script:Root 'astrbot' }
+        if (-not $work) { $work = $script:AbDir }
         return [pscustomobject]@{ Kind = 'cli'; Root = $work; Config = (Join-Path $work 'data\cmd_config.json'); Cli = $cli }
     }
     return $null
 }
 
 function Get-AnyNapCatRoot {
-    $onekey = Join-Path $script:Root 'napcat-onekey'
+    $onekey = $script:NcDir
     if (Test-Path $onekey) {
         $ready = @(Get-ChildItem $onekey -Directory -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -match '^NapCat\.[\d.]+\.Shell$' -or (Test-Path (Join-Path $_.FullName 'NapCatWinBootMain.exe')) } |
@@ -2306,7 +2379,7 @@ try {
         $probeCfg = $null
         $found = @(Get-LauncherInstances)
         if ($found.Count -gt 0) { $probeCfg = Join-Path $found[0].FullName 'core\data\cmd_config.json' }
-        elseif (Test-Path (Join-Path (Join-Path $script:Root 'astrbot') 'data\cmd_config.json')) { $probeCfg = Join-Path (Join-Path $script:Root 'astrbot') 'data\cmd_config.json' }
+        elseif (Test-Path (Join-Path ($script:AbDir) 'data\cmd_config.json')) { $probeCfg = Join-Path ($script:AbDir) 'data\cmd_config.json' }
         if ($probeCfg -and (Test-Path $probeCfg)) {
             $j = Read-Json $probeCfg
             $pl = @($j.platform) | Where-Object { $_.type -eq 'aiocqhttp' } | Select-Object -First 1

@@ -67,6 +67,35 @@ install-plus.ps1       升级版入口（多拉 plugin/ 整个包）
 deploy.ps1             Windows 部署脚本（只管装软件 + 有插件就调安装器）
 ```
 
+## 装在哪：`ds-as-nap\`
+
+**所有东西都装在脚本旁边的 `ds-as-nap\` 里**，不往用户目录、系统目录散：
+
+```
+ds-as-nap\
+  astrbot\        AstrBot 本体（独立 venv）+ data\（配置、插件、聊天记录）
+  napcat\         NapCat 一体包（含它自带的 QQ）
+  python\         Python 3.12（只给 AstrBot 用）
+  uv\             uv（单个 exe）
+  logs\           部署与安装日志
+  _install\       入口脚本下载下来的 deploy.ps1 / 插件包
+```
+
+想搬走整个机器人？把 `ds-as-nap\` 拷到别的机器同一位置就行。
+
+几个和"装得干净"有关的取舍：
+
+- **Python 用可嵌入版 zip**，不用官方安装器。官方安装器会在注册表里留"已安装"记录，
+  某些机器上再跑会认为装过了、什么都不做（`WixBundleInstalled=1`，退出码还是 0），
+  排查起来极其费劲。可嵌入版是纯解包，装在哪就在哪，删目录即卸载。
+  代价是它默认不加载 site-packages，脚本会顺手把 `python312._pth` 里的 `import site` 放开。
+- **uv 也是一个 exe**，放进 `ds-as-nap\uv\`，不碰 `%USERPROFILE%\.local\bin`。
+- AstrBot 装在 `ds-as-nap\astrbot\.venv` 里（`uv venv` + `uv pip install`），
+  不是全局的 `uv tool install`，所以卸载就是删目录。
+
+> 路径里有空格（比如 `A:\true porject\`）会让外部命令的参数被劈开。
+> 脚本里所有传给 `Start-Process` 的路径参数都已经显式加了引号，改的时候别漏。
+
 ## 仓库结构
 
 ```

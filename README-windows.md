@@ -79,7 +79,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy.ps1
 - 安装期间**窗口的关闭按钮会被摘掉**，误点 X 关不掉；装完自动恢复（`finally` 里恢复，
   中途报错也会恢复）。
 - 按 Ctrl+C：第一下不杀，先收拾现场；**要真中止得连按两次**。
-- 万一被强杀、断电、任务管理器结束：会留下断点标记 `%LOCALAPPDATA%\dsh-qq-deploy\.install-in-progress.json`，
+- 万一被强杀、断电、任务管理器结束：会留下断点标记 `ds-as-nap\.install-in-progress.json`，
   下次运行会明确告诉你"上次卡在哪个阶段"，重跑接着装，已经装好的不重装。
 
 > 内部约定：本脚本**不要用 `Invoke-WebRequest @参数表`（splatting）**。实测在装了安全软件的
@@ -92,7 +92,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy.ps1
 
 | 形态 | 怎么来的 | 配置在哪 |
 | --- | --- | --- |
-| `cli` | 本脚本跑官方 `install.ps1` 装的 | `<工作目录>\data\cmd_config.json`，工作目录默认 `%LOCALAPPDATA%\dsh-qq-deploy\astrbot` |
+| `cli` | 本脚本跑官方 `install.ps1` 装的 | `<工作目录>\data\cmd_config.json`，工作目录默认 `ds-as-nap\astrbot` |
 | `launcher` | 用户自己用启动器装的 | `%USERPROFILE%\.astrbot_launcher\instances\<id>\core\data\cmd_config.json` |
 
 `-Mode auto`（默认）：发现启动器实例就用它，没有就走 CLI 安装。
@@ -219,7 +219,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy.ps1
 
 ## 日志
 
-`%LOCALAPPDATA%\dsh-qq-deploy\logs\`
+`ds-as-nap\logs\`
 
 - `deploy-<时间>.log`：脚本每一步
 - `astrbot-install-<时间>.log`：官方安装脚本的输出

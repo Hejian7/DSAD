@@ -51,7 +51,7 @@ function Get-Remote([string]$RelPath, [string]$Dest) {
     return $false
 }
 
-$work = Join-Path $env:LOCALAPPDATA 'dsh-qq-deploy\bootstrap'
+$work = Join-Path $PSScriptRoot 'ds-as-nap\_install'
 if (-not (Test-Path $work)) { New-Item -ItemType Directory -Path $work -Force | Out-Null }
 
 Say ''
