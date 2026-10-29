@@ -68,6 +68,37 @@ $script:CtrlCStrikes = 0
 $script:GuardLoaded = $false
 $script:CurrentStage = ''
 $script:MarkerFile = Join-Path $script:Root '.install-in-progress.json'
+$script:LockFile = Join-Path $script:Root '.deploy.lock'
+
+# 双击两次是最常见的人为事故：两个部署同时改同一份配置，最后谁对谁错说不清
+function Enter-DeployLock {
+    try {
+        if (-not (Test-Path $script:Root)) { New-Item -ItemType Directory -Path $script:Root -Force | Out-Null }
+        if (Test-Path $script:LockFile) {
+            $raw = (Get-Content $script:LockFile -Raw -ErrorAction SilentlyContinue)
+            $oldPid = 0
+            if ($raw) { [void][int]::TryParse($raw.Trim(), [ref]$oldPid) }
+            if ($oldPid -gt 0 -and $oldPid -ne $PID) {
+                $alive = Get-Process -Id $oldPid -ErrorAction SilentlyContinue
+                if ($alive) {
+                    Fail '已经有一个部署在跑着了' ("另一个窗口正在部署（PID $oldPid）。`n等它跑完，或者先把那个窗口关掉再双击。`n（两个进程同时改配置会互相覆盖，所以这里直接拦下）")
+                }
+            }
+        }
+        Set-Content -Path $script:LockFile -Value $PID -Encoding ASCII
+    } catch { }
+}
+
+function Exit-DeployLock {
+    try {
+        if (Test-Path $script:LockFile) {
+            $raw = (Get-Content $script:LockFile -Raw -ErrorAction SilentlyContinue)
+            $oldPid = 0
+            if ($raw) { [void][int]::TryParse($raw.Trim(), [ref]$oldPid) }
+            if ($oldPid -eq $PID) { Remove-Item $script:LockFile -Force -ErrorAction SilentlyContinue }
+        }
+    } catch { }
+}
 
 function Set-WindowTitle([string]$Text) {
     if ($Quiet) { return }
@@ -1389,39 +1420,163 @@ function Restart-NapCat([string]$NapCatPath) {
     Start-Sleep -Seconds 4
 }
 
-function Start-NapCat([string]$NapCatPath, [string]$QQNumber, [int]$Port) {
-    Step 6 '启动 NapCat 并等扫码'
+function Test-NapCatConnected([int]$Port) {
+    return [bool](Get-NetTCPConnection -RemotePort $Port -State Established -ErrorAction SilentlyContinue)
+}
 
-    $running = Get-NapCatRunning $NapCatPath
-    if ($running.Count -gt 0) { Ok ('NapCat 已在运行（PID ' + (($running | ForEach-Object { $_.ProcessId }) -join ',') + '）') }
-    else {
-        Start-Process -FilePath (Join-Path $NapCatPath 'NapCatWinBootMain.exe') -WorkingDirectory $NapCatPath | Out-Null
-        Ok 'NapCat 已启动（可能弹窗口，别关它）'
+function Get-NapCatWebUi([string]$NapCatPath) {
+    foreach ($d in @(Get-NapCatConfigDirs $NapCatPath)) {
+        $f = Join-Path $d 'webui.json'
+        if (-not (Test-Path $f)) { continue }
+        try {
+            $j = Read-Json $f
+            $p = 6099
+            if ($j.port) { $p = [int]$j.port }
+            return [pscustomobject]@{ Url = ('http://127.0.0.1:' + $p); Token = [string]$j.token; Path = $f }
+        } catch { }
     }
+    return $null
+}
 
-    Start-Sleep -Seconds 2
-    $qr = Get-ChildItem $NapCatPath -Recurse -Filter 'qrcode.png' -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    if ($qr -and ((Get-Date) - $qr.LastWriteTime).TotalSeconds -lt 300) {
-        Info ('登录二维码：' + $qr.FullName)
-        try { Invoke-Item $qr.FullName } catch { Warn '二维码打不开，按上面的路径自己看' }
+function Open-QrFile([string]$Path) {
+    if (-not (Test-Path $Path)) { return $false }
+    try { Start-Process -FilePath $Path; return $true } catch { }
+    try { Start-Process -FilePath 'mspaint.exe' -ArgumentList ('"' + $Path + '"'); return $true } catch { }
+    return $false
+}
+
+# 扫码这一步最容易让人懵，所以把话说满：大标题、扫哪个号、扫完会怎样、文件在哪
+function Show-QrCode([string]$Path, [string]$QQNumber) {
+    Say ''
+    Say '  ============================================================' 'Cyan'
+    Say '   现在用手机 QQ 扫下面这张二维码' 'Cyan'
+    Say '  ============================================================' 'Cyan'
+    Say ''
+    Say '   第 1 步：打开手机 QQ → 右上角「+」→ 扫一扫'
+    Say ('   第 2 步：登录的号必须是  ' + $QQNumber + '    ← 别扫成自己的常用号') 'Yellow'
+    Say '   第 3 步：扫完就放那儿，程序会自己往下走，不用按任何键'
+    Say ''
+    Say ('   二维码文件：' + $Path) 'DarkGray'
+    if (Open-QrFile $Path) {
+        Say '   已经帮你把这张图打开了 —— 没弹出来就看上面这个路径，手动双击它。' 'Green'
     } else {
-        Info '暂时没有二维码：用 QQ 客户端登录一次，或等 NapCat 窗口里出现。'
+        Say '   ！自动打开失败：请手动双击上面这个路径。' 'Yellow'
+    }
+    Say ''
+}
+
+function Wait-NapCatLogin([string]$NapCatPath, [string]$QQNumber, [int]$Port) {
+    if (Test-NapCatConnected $Port) { return $true }
+
+    $start = Get-Date
+    $deadline = $start.AddMinutes(6)
+    $lastKey = ''
+    $lastScan = [DateTime]::MinValue
+    $lastBeat = 0
+    $lastReopen = 0
+    $reopenCount = 0
+
+    while ((Get-Date) -lt $deadline) {
+        if ($script:InterruptRequested) { throw '用户已请求中断' }
+        if (Test-NapCatConnected $Port) { return $true }
+
+        $elapsed = [int]((Get-Date) - $start).TotalSeconds
+
+        # 每 2 秒找一次二维码；新出或更新过就展示
+        if (((Get-Date) - $lastScan).TotalSeconds -ge 2) {
+            $lastScan = Get-Date
+            $qr = Get-ChildItem $NapCatPath -Recurse -Filter 'qrcode.png' -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($qr -and ((Get-Date) - $qr.LastWriteTime).TotalSeconds -lt 240) {
+                $key = $qr.FullName + '|' + $qr.LastWriteTime.Ticks
+                if ($key -ne $lastKey) {
+                    $lastKey = $key
+                    Show-QrCode $qr.FullName $QQNumber
+                    $lastReopen = $elapsed
+                    $reopenCount = 0
+                }
+            }
+        }
+
+        # 二维码可能被客户关掉了：每 90 秒再打开一次，最多 3 次
+        if ($lastKey -and ($elapsed - $lastReopen) -ge 90 -and $reopenCount -lt 3) {
+            $reopenCount++
+            $lastReopen = $elapsed
+            $qrPath = ($lastKey -split '\|')[0]
+            if (Test-Path $qrPath) {
+                Say ('   再帮你打开一次二维码（第 ' + $reopenCount + ' 次）：' + $qrPath) 'DarkGray'
+                [void](Open-QrFile $qrPath)
+            }
+        }
+
+        # 进程没了就立刻停，别让客户对着黑屏等 6 分钟
+        if (-not (Get-NapCatRunning $NapCatPath)) {
+            Warn 'NapCat 进程已经不在了（登录窗口是不是被关掉了？）'
+            return $false
+        }
+
+        if (($elapsed - $lastBeat) -ge 30) {
+            $lastBeat = $elapsed
+            if ($lastKey) { Info ('还在等你扫码…… 已等 ' + $elapsed + ' 秒 / 最多 360 秒') }
+            else { Info ('NapCat 正在准备登录界面…… 已等 ' + $elapsed + ' 秒') }
+        }
+        Start-Sleep -Milliseconds 900
+    }
+    return $false
+}
+
+function Start-NapCat([string]$NapCatPath, [string]$QQNumber, [int]$Port) {
+    Step 6 '启动 NapCat，扫码登录'
+
+    if (Test-NapCatConnected $Port) {
+        Ok 'NapCat 已经连着 AstrBot 了，这次不用扫码'
+        return
     }
 
-    $okWs = Wait-Until { [bool](Get-NetTCPConnection -RemotePort $Port -State Established -ErrorAction SilentlyContinue) } 300 '客户扫码 / 自动登录'
-    if (-not $okWs) {
-        Fail '等了五分钟，NapCat 一直没连上 AstrBot' @"
+    $boot = Join-Path $NapCatPath 'NapCatWinBootMain.exe'
+    if (-not (Test-Path $boot)) {
+        Fail 'NapCat 主程序不见了' ('这个文件不在：' + $boot + '`n重新部署一次，或者用 -NapCatDir 指到正确的目录。')
+    }
+
+    $running = @(Get-NapCatRunning $NapCatPath)
+    if ($running.Count -gt 0) {
+        Ok ('NapCat 已经在运行（PID ' + (($running | ForEach-Object { $_.ProcessId }) -join ',') + '）')
+    } else {
+        try {
+            Start-Process -FilePath $boot -WorkingDirectory $NapCatPath | Out-Null
+            Ok 'NapCat 已启动（会拉起 QQ 登录窗口，别关它）'
+        } catch {
+            Fail 'NapCat 启动失败' ('错误：' + $_.Exception.Message + '`n路径：' + $boot + '`n可能是杀软拦了，把整个 NapCat 目录加白名单再试。')
+        }
+    }
+
+    Say ''
+    Say '   接下来：NapCat 拉起 QQ → 生成登录二维码 → 我自动帮你打开。' 'White'
+    Say '   出现二维码之前可能要等十几秒，别急，也别关窗口。' 'DarkGray'
+    Say ''
+
+    $ok = Wait-NapCatLogin $NapCatPath $QQNumber $Port
+    if (-not $ok) {
+        $web = Get-NapCatWebUi $NapCatPath
+        $webHint = ''
+        if ($web) {
+            $webHint = "`n4) 去 NapCat 面板手动登录：$($web.Url)   （token：$($web.Token)）"
+        }
+        Fail '等了 6 分钟，还是没登录成功' @"
 按顺序排查：
 
-  1) 二维码过期：重跑本脚本会弹新码
-  2) 扫的不是机器人号：确认扫的是 QQ $QQNumber
-  3) QQ 与 NapCat 版本对不上：看第 3.5 步
-  4) 端口被占用：-OneBotPort 换一个
-  5) 杀软拦了注入：把 NapCat 目录加白名单
+  1) 二维码没看到 / 过期了：重跑一遍本脚本，会重新出码并自动打开
+  2) 扫成了别的号：必须是 QQ $QQNumber
+  3) NapCat 的登录窗口是不是被关掉了？关掉就得重跑
+$webHint
+  5) 杀软拦了注入（QQ 闪退 / 一直转圈）：把
+     $NapCatPath
+     整个目录加进白名单，再用管理员重跑
 "@
     }
+
     Ok 'NapCat 已连上 AstrBot（反向 WS 通）'
+    Say '   扫码成功，登录凭证会留下来，下次重启不用再扫。' 'Green'
 }
 
 # ── 自检 / 守护 / 回滚 ────────────────────────────────────────────────────
@@ -1671,6 +1826,9 @@ try {
 
     if ($Uninstall) { Remove-Deployment; exit 0 }
 
+    # 双击两次会起两个部署，互相覆盖配置——直接拦下
+    if ($Action -eq 'Deploy' -and -not $Probe -and -not $SelfCheck) { Enter-DeployLock }
+
     # 上次没跑完？先把话说清楚，别让客户对着“装一半”犯迷糊
     if ($Action -eq 'Deploy' -and -not $Probe -and -not $SelfCheck) {
         $prev = Get-PreviousRun
@@ -1784,9 +1942,12 @@ try {
 
     Say ''
     Say '部署完成。' 'Green'
-    Say ('  客户 QQ：' + $QQ)
-    Say '  AstrBot WebUI：http://127.0.0.1:6185'
+    Say ('  机器人 QQ：' + $QQ)
+    Say '  AstrBot 面板：http://127.0.0.1:6185'
     Say ('  日志目录：' + $script:LogDir)
+    Say ''
+    Say '  现在去 QQ 里给这个号发一句话试试（群里要先 @ 它）。' 'White'
+    Say '  之后日常用「启动.cmd / 停止.cmd / 状态.cmd」，不用再跑这个部署脚本。' 'DarkGray'
     Say ''
     Clear-RunMarker
     Set-WindowTitle '部署完成'
@@ -1804,6 +1965,7 @@ catch {
     Fail ('未预期的错误：' + $_.Exception.Message) ("这一条不在常见问题里，把日志发给懂行的人看：`n" + $script:LogFile)
 }
 finally {
-    # 无论如何把关闭按钮还回去，别让客户对着关不掉的窗口发呆
+    # 无论如何把关闭按钮还回去，别让客户对着关不掉的窗口发呆；锁也要放掉
     Set-CloseButton $true
+    Exit-DeployLock
 }
