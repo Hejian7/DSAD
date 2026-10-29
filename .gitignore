@@ -18,3 +18,7 @@ Thumbs.db
 # Python
 __pycache__/
 *.pyc
+
+# 安装产物（运行时目录，绝不入库）
+ds-as-nap/
+_chain2.ps1
