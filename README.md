@@ -45,27 +45,41 @@ sudo bash linuxdsq/deploy.sh --qq 123456789 --api-key sk-xxxx
 
 ## 两个版本：基础版 / 升级版
 
-客户拿到的入口只有两个：
+客户拿到的就是**一个 `.cmd` 文件**，不需要别的任何东西：
 
-| 版本 | 入口 | 拉什么 | 装什么 |
+| 版本 | 文件 | 自己下载什么 | 装什么 |
 | --- | --- | --- | --- |
-| 基础版 | `安装-基础版.cmd` | 只拉 `deploy.ps1` | 只装软件（AstrBot + NapCat） |
+| 基础版 | `安装-基础版.cmd` | 只下 `deploy.ps1` | 只装软件（AstrBot + NapCat） |
 | 升级版 | `安装-升级版.cmd` | `deploy.ps1` + `plugin/` 整个插件包 | 软件 + 看门狗插件 |
 
-**区别不在于部署脚本写了分支，而在于包里有没有 `plugin/install-plugin.ps1`。**
+每个 `.cmd` 内部自带一段 PowerShell：先建 `ds-as-nap\_install\`，从 GitHub 把
+`deploy.ps1` 拉下来（直连不通自动换 jsdelivr / ghproxy / ghfast），再调它。
+**空目录里双击就能跑**，不需要预先存在任何 `.ps1`。
+
+**基础版和升级版的差别不在于部署脚本写了分支，而在于包里有没有 `plugin/install-plugin.ps1`。**
 部署脚本装完软件后会去 `plugin\` 底下看一眼：
 - 有 `install-plugin.ps1` → 直接执行它 → 插件被装进 AstrBot
 - 没有 → 打印「基础版：包里没有插件安装器，跳过选装插件」，继续自检收尾
 
 所以以后加新插件，只要在 `plugin/` 里放个同名安装器，部署脚本不用改。
 
+两个调试用的环境变量：
+
+```bat
+set DSAD_NO_RUN=1        :: 只下载不安装，用来确认网络通不通
+set DSAD_BASE_URL=...    :: 换成自己的镜像/中转（默认走 GitHub 四个源）
 ```
-install-basic.ps1      基础版入口（下载 deploy.ps1 后执行）
-install-plus.ps1       升级版入口（多拉 plugin/ 整个包）
-安装-基础版.cmd         给客户双击的壳
-安装-升级版.cmd         给客户双击的壳
-deploy.ps1             Windows 部署脚本（只管装软件 + 有插件就调安装器）
+
 ```
+安装-基础版.cmd   单文件入口：下 deploy.ps1 并跑
+安装-升级版.cmd   单文件入口：下 deploy.ps1 + plugin/ 并跑
+卸载.cmd         单文件入口：调 deploy.ps1 -Uninstall
+deploy.ps1       部署脚本（只管装软件 + 有插件就调安装器 + 卸载）
+```
+
+> **改 `.cmd` 的两个坑**：必须用 **CRLF** 换行（LF 会被 cmd 吞字符，报一堆
+> "'rofile' 不是内部或外部命令"），并且**不能带 UTF-8 BOM**（cmd 会把 BOM 当命令的一部分）。
+> 中文要在 `chcp 65001` 之后才输出。
 
 ## 装在哪：`ds-as-nap\`
 
