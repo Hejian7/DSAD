@@ -13,6 +13,7 @@
 param(
     [ValidateSet('ask', 'astrbot', 'napcat', 'plugin', 'all')]
     [string]$Target = 'ask',
+    [string]$InstallRoot = '',
     [switch]$Yes,
     [switch]$DryRun
 )
@@ -27,8 +28,21 @@ function Title([string]$T) {
     Say '============================================================' 'Cyan'
 }
 
-# 安装根：本脚本旁边的 ds-as-nap
-$AsRoot = Join-Path $PSScriptRoot 'ds-as-nap'
+# 安装根：优先用显式参数；否则找本脚本旁边的 ds-as-nap；
+# 再不行就看自己是不是被放在 ds-as-nap 的子目录里（比如 _install\）。
+if ($InstallRoot) {
+    $AsRoot = $InstallRoot
+} else {
+    $guess = Join-Path $PSScriptRoot 'ds-as-nap'
+    if (Test-Path $guess) {
+        $AsRoot = $guess
+    } elseif ((Split-Path (Split-Path $PSScriptRoot -Parent) -Leaf) -eq 'ds-as-nap') {
+        $AsRoot = Split-Path $PSScriptRoot -Parent
+    } else {
+        $AsRoot = $guess
+    }
+}
+$AsRoot = [IO.Path]::GetFullPath($AsRoot)
 $AbDir = Join-Path $AsRoot 'astrbot'
 $NcDir = Join-Path $AsRoot 'napcat'
 $PluginDir = Join-Path $AbDir 'data\plugins\almost_perfect'
