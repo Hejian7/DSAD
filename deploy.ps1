@@ -2023,6 +2023,13 @@ function Install-AlmostPerfectPlugin($AstrBotTarget, [string]$NapCatRoot, [int]$
         $dataDir = Join-Path $AstrBotTarget.Root 'data'
     }
     $dstDir = Join-Path $dataDir 'plugins\almost_perfect'
+    $cfgPath = Join-Path $dstDir 'settings.json'
+
+    # 先记住客户改过的配置：下面整目录覆盖会把 settings.json 也盖掉
+    $oldCfg = $null
+    if (Test-Path $cfgPath) {
+        try { $oldCfg = Read-Json $cfgPath } catch { }
+    }
 
     try {
         if (-not (Test-Path $dstDir)) { New-Item -ItemType Directory -Path $dstDir -Force | Out-Null }
@@ -2044,10 +2051,9 @@ function Install-AlmostPerfectPlugin($AstrBotTarget, [string]$NapCatRoot, [int]$
         } catch { }
     }
 
-    # 配置：保留客户改过的项，只把机器相关的填进去
-    $cfgPath = Join-Path $dstDir 'settings.json'
-    $cfg = $null
-    if (Test-Path $cfgPath) {
+    # 配置：优先沿用客户原来那份（上面已备份），只把机器相关的填进去
+    $cfg = $oldCfg
+    if (-not $cfg -and (Test-Path $cfgPath)) {
         try { $cfg = Read-Json $cfgPath } catch { }
     }
     if (-not $cfg) {
