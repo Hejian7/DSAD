@@ -1385,9 +1385,15 @@ function Initialize-AstrBotWorkdir($Target) {
 }
 
 function Get-AstrBotProcess {
+    # AstrBot 有两种跑法，都得认：
+    #   1) 源码跑：python.exe ...\core\main.py
+    #   2) 装出来的：python.exe "...\Scripts\astrbot.exe" run  ← 我们现在走的是这条
+    # 只认第一种的话，自检会一直报"AstrBot 进程不在"，可 6199 明明是它在听。
+    # （python.exe 被硬塞进命令行，是因为 venv 里的 astrbot.exe 只是个启动壳，
+    #   真干活的进程名还是 python.exe。）
     $list = @()
     $list += @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -match 'core\\main\.py' })
+        Where-Object { $_.CommandLine -and ($_.CommandLine -match 'core\\main\.py' -or $_.CommandLine -match 'astrbot\.exe') })
     $list += @(Get-CimInstance Win32_Process -Filter "Name='astrbot.exe'" -ErrorAction SilentlyContinue)
     return $list
 }
