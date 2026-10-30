@@ -92,9 +92,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy.ps1
 
 ---
 
-## 客户手里只有三个 .cmd
+## 客户手里只有三个 .cmd（装完会多出一套）
 
-**仓库里不放安装入口。** 仓库只当拉取源，客户拿到的是发布目录里这三个文件：
+**仓库里不放安装入口。** 仓库只当拉取源，客户最初拿到的是这三个文件：
 
 | 文件 | 干什么 |
 | --- | --- |
@@ -102,9 +102,18 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy.ps1
 | `安装-升级版.cmd` | 多拉 `plugin\`（Almost perfect 看门狗插件） |
 | `卸载.cmd` | 调 `deploy.ps1 -Uninstall`，可选只删某个组件 |
 
-两个安装脚本都会**顺带把 `卸载.cmd` 拉到同一层**（拉下来的如果是 LF 换行会被重写成 CRLF，
-cmd 对 LF 是硬伤）。拉不到也不影响安装：`deploy.ps1` 一开始部署就会在安装根旁边补一份
-（`Ensure-UninstallEntry`）。**装得进去就一定要卸得掉。**
+安装脚本会**顺带把日常要用的那一整套入口拉到同一层**：
+`一键部署.cmd` `启动.cmd` `停止.cmd` `状态.cmd` `环境检查.cmd` `备份数据.cmd` `查看日志.cmd` `卸载.cmd`。
+它们各自都会找到 `ds-as-nap\_install\deploy.ps1`（查找顺序见下面「双击就能用」那节），
+客户装完直接双击就行，不用再上 GitHub 扒。
+
+两个细节：
+
+- 从 GitHub 裸拉下来是 LF 换行，cmd 会把它切错行（`echo` 能变成 `e` + `cho`），
+  所以下载后统一重写成 CRLF；仓库那边也靠 `.gitattributes` 的 `*.cmd -text` 存成 CRLF。
+- 万一哪个入口没拉成：不算失败，只报一行 WARN，安装照常继续。
+  而 `卸载.cmd` 被 `deploy.ps1` 兜了底——部署一开始就在安装根旁边补一份
+  （`Ensure-UninstallEntry`）。**装得进去就一定要卸得掉。**
 
 ### 基础版和升级版差在哪
 
