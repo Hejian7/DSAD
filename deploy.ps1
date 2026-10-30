@@ -2158,10 +2158,8 @@ function Restart-NapCat([string]$NapCatPath) {
     }
 
     # 停了就要拉起来，不然配置写完了也没人读
-    $launcher = Get-NapCatLauncher $NapCatPath
-    if (-not (Test-Path $launcher)) { return $false }
     try {
-        Start-Process -FilePath $launcher -WorkingDirectory $NapCatPath | Out-Null
+        Start-NapCatBoot $NapCatPath
     } catch {
         Warn ('NapCat 拉不起来：' + $_.Exception.Message)
         return $false
@@ -2350,6 +2348,49 @@ function Wait-NapCatConnected([int]$Port, [int]$TimeoutSec = 120) {
 }
 
 # 启动 NapCat → 扫码 → 返回实际登录的 QQ 号（这才是准的，不是参数里那个）
+# 直接调注入器，不经过 NapCat 自带的 launcher.bat。
+# launcher.bat 中间那几步（net session 提权 → reg query 找 QQ → 拼参数）在某些机器上
+# 会静默退出，bootmain 压根没被调用 —— 客户看到的就是"NapCat 一闪没影"，
+# 可手动带参数跑 bootmain 一切正常。它真正需要的只有两个路径 + 五个环境变量，
+# 那就自己设、自己调，少一层猜谜。
+function Start-NapCatBoot([string]$NapCatPath) {
+    $boot = Join-Path $NapCatPath 'NapCatWinBootMain.exe'
+    $inject = Join-Path $NapCatPath 'NapCatWinBootHook.dll'
+    if (-not (Test-Path $boot)) { Fail 'NapCat 主程序不见了' ('这个文件不在：' + $boot) }
+    if (-not (Test-Path $inject)) { Fail 'NapCat 注入用的 DLL 不见了' ('这个文件不在：' + $inject) }
+
+    # 一体包：QQ 就在 NapCat 目录里；Shell 包：用机器上装的那个 QQ
+    $qqExe = Join-Path $NapCatPath 'QQ.exe'
+    if (-not (Test-Path $qqExe)) {
+        $qq = Get-QqClientInfo
+        if (-not $qq) { Fail '找不到 QQ.exe，没法注入' '装个 QQ，或者用 -NapCatMode onekey 走自带 QQ 的一体包。' }
+        $qqExe = Join-Path $qq.Root 'QQ.exe'
+        if (-not (Test-Path $qqExe)) { Fail ('QQ 目录里没有 QQ.exe：' + $qq.Root) '装一个完整版的 QQ NT。' }
+    }
+
+    # 关键：不能只给本进程设环境变量再 Start-Process 就完事。
+    # PS 5.1 的 Start-Process 走 ShellExecute 时，子进程不继承改过的环境变量，
+    # bootmain 拿不到 NAPCAT_* 就会空转——进程在、6099 永远不监听、也不报错。
+    # 所以生成一个带 set 的 cmd，让 cmd 自己去设、自己去调。
+    $wrap = Join-Path $NapCatPath 'start-napcat-dsh.cmd'
+    $lines = @(
+        '@echo off',
+        'chcp 65001 >nul',
+        'cd /d "%~dp0"',
+        '',
+        'set "NAPCAT_PATCH_PACKAGE=%~dp0qqnt.json"',
+        'set "NAPCAT_LOAD_PATH=%~dp0loadNapCat.js"',
+        'set "NAPCAT_INJECT_PATH=%~dp0NapCatWinBootHook.dll"',
+        'set "NAPCAT_LAUNCHER_PATH=%~dp0NapCatWinBootMain.exe"',
+        'set "NAPCAT_MAIN_PATH=%~dp0napcat.mjs"',
+        '',
+        ('"%~dp0NapCatWinBootMain.exe" "' + $qqExe + '" "%~dp0NapCatWinBootHook.dll"')
+    )
+    [IO.File]::WriteAllLines($wrap, $lines, (New-Object System.Text.UTF8Encoding($false)))
+    Start-Process -FilePath $wrap -WorkingDirectory $NapCatPath | Out-Null
+    Ok ('注入器已启动，目标 QQ：' + $qqExe)
+}
+
 function Start-NapCat([string]$NapCatPath, [string]$ExpectQQ, [int]$Port, [switch]$SkipPrompt) {
     Step 5 '启动 NapCat，用小号扫码登录'
 
@@ -2377,8 +2418,7 @@ function Start-NapCat([string]$NapCatPath, [string]$ExpectQQ, [int]$Port, [switc
         }
 
         try {
-            $launcher = Get-NapCatLauncher $NapCatPath
-            Start-Process -FilePath $launcher -WorkingDirectory $NapCatPath | Out-Null
+            Start-NapCatBoot $NapCatPath
             Ok 'NapCat 已启动（会拉起 QQ 登录窗口，别关它）'
         } catch {
             Fail 'NapCat 启动失败' ('错误：' + $_.Exception.Message + '`n路径：' + $boot + '`n可能是杀软拦了，把整个 NapCat 目录加白名单再试。' + "`n如果用的是机器上现成的 QQ（Shell 包），也可能 QQ 版本和 NapCat 对不上：重跑加 -NapCatMode onekey，改用自带 QQ 的一体包。")
@@ -2853,7 +2893,7 @@ function Invoke-ActionStart {
     if ($nap) {
         # 启动前先清场：避免上一次没退干净的 NapCat 和这次抢同一个 QQ
         if (Stop-AllNapCat) { Info '已先关掉旧的 NapCat 进程' }
-        Start-Process -FilePath (Join-Path $nap 'NapCatWinBootMain.exe') -WorkingDirectory $nap | Out-Null
+        Start-NapCatBoot $nap
         Ok 'NapCat 已拉起'
     } else { Warn '没找到 NapCat：先跑一次「一键部署.cmd」' }
 
