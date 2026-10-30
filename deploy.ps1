@@ -604,7 +604,7 @@ function Wait-ProcessWithProgress {
         if ($line -and $line -ne $lastLine) { $lastLine = $line; $lastMove = $elapsed }
 
         # 卡死检测：真死掉的连接不会自己好，早点杀掉换源，比干等到总超时强
-        if ($StallSec -gt 0 -and ($elapsed - $lastMove) -ge $StallSec) {
+        if ($StallSec -gt 0 -and $totalPkgs -gt 0 -and ($elapsed - $lastMove) -ge $StallSec) {
             try { $Process.Kill() } catch { }
             return -3
         }
@@ -619,14 +619,14 @@ function Wait-ProcessWithProgress {
             } elseif ($done -gt 0) {
                 $beat += (' ｜ 已处理 ' + $done + ' 个包')
             } elseif ($LogPath) {
-                $beat += ' ｜ 正在解析依赖'
+                $beat += ' ｜ 正在解析依赖（这一步慢是常态）'
             }
             if ($line) {
                 $short = $line
                 if ($short.Length -gt 50) { $short = $short.Substring(0, 50) + '…' }
                 $beat += (' ｜ ' + $short)
             }
-            if (($elapsed - $lastMove) -ge 120) { $beat += ' ｜（两分钟没新动静：多半是网慢，脚本没死）' }
+            if ($totalPkgs -gt 0 -and ($elapsed - $lastMove) -ge 180) { $beat += ' ｜（三分钟没新包：网可能在卡，脚本没死）' }
             Write-Host $beat -ForegroundColor DarkGray
             Write-Log $beat
         }
@@ -1189,6 +1189,8 @@ function Install-AstrBotViaUv {
     $indexes = @(
         'https://pypi.tuna.tsinghua.edu.cn/simple',
         'https://mirrors.aliyun.com/pypi/simple',
+        'https://mirrors.ustc.edu.cn/pypi/simple',
+        'https://mirror.nju.edu.cn/pypi/web/simple',
         'https://mirrors.cernet.edu.cn/pypi/web/simple'
     )
     # 先量一下哪个镜像快：装 300 多个包，源慢一倍就是十几分钟
@@ -1244,12 +1246,14 @@ function Install-AstrBotOfficial {
         Info ('复用已下载的安装脚本：' + $ps1)
     }
 
+    Info '官方脚本自己画进度条，那些进度不会写进日志——所以这条路上可能很久看不到字，别以为死了'
+    Info '（真嫌慢就按 Ctrl+C 连按两次停掉，删掉 ds-as-nap\astrbot\.venv 后重跑，会换条路重试）'
     $log = Join-Path $script:LogDir ('astrbot-install-{0}.log' -f (Get-Date -Format 'HHmmss'))
     $proc = Start-Process -FilePath 'powershell.exe' `
         -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $ps1 + '"'), '-Language', 'zh-CN', '-DownloadSource', $DownloadSource, '-NonInteractive') `
         -RedirectStandardOutput $log -RedirectStandardError ($log + '.err') -PassThru -NoNewWindow
 
-    $code = Wait-ProcessWithProgress -Process $proc -Label '安装 AstrBot（官方脚本）' -TimeoutSec 900 -LogPath $log
+    $code = Wait-ProcessWithProgress -Process $proc -Label '安装 AstrBot（官方脚本）' -TimeoutSec 1500 -LogPath $log
     if ($code -eq -2) {
         Fail 'AstrBot 安装超过 15 分钟没动静' ("日志：" + $log + "`n先跑一次 -Action Check 看装到哪一步了。")
     }
