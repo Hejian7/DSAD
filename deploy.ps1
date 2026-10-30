@@ -1563,10 +1563,31 @@ function Test-NapCatSelfContained([string]$Root) {
     return $false
 }
 
+# 这份 NapCat 能不能配这台机器的 QQ：比 qqnt.json 的 buildVersion 和 QQ 的 build 号。
+# 拿不准的一律放行（没有清单、没有 QQ、解析不出来），只在"明确对不上"时返回 false。
+function Test-NapCatQqBuild([string]$NapCatPath) {
+    $qqnt = Join-Path $NapCatPath 'qqnt.json'
+    if (-not (Test-Path $qqnt)) { return $true }
+    $want = ''
+    try { $want = [string](Get-Content $qqnt -Raw -Encoding UTF8 | ConvertFrom-Json).buildVersion } catch { }
+    if (-not $want) { return $true }
+    $qq = Get-QqClientInfo
+    if (-not $qq) { return $true }
+    $have = ''
+    if ($qq.Version -match '-(\d+)$') { $have = $matches[1] }
+    if (-not $have) { return $true }
+    return ($want -eq $have)
+}
+
 function Install-NapCatOneKey {
     Step '3.1' '安装 NapCat 一体包（自带 QQ，不用客户预装）'
 
     $base = $script:NcDir
+    # 上一轮要是装过 Shell 包，这里会留一堆残留；和一体包混在一起，后面找目录会认岔
+    if (Test-Path (Join-Path $base 'NapCatWinBootMain.exe')) {
+        Info '清掉上一次 Shell 包的残留'
+        Remove-Item $base -Recurse -Force -ErrorAction SilentlyContinue
+    }
     if (-not (Test-Path $base)) { New-Item -ItemType Directory -Path $base -Force | Out-Null }
 
     $zip = Join-Path $base 'NapCat.Shell.Windows.OneKey.zip'
@@ -1683,6 +1704,25 @@ function Install-NapCatShell {
         return $null
     }
     $root = Split-Path $boot.FullName -Parent
+
+    # 版本对不上就别硬上。NapCat 的注入是按 QQ 的 build 号做的，差一个 build 都可能起不来——
+    # 客户看到的现象就是「NapCat 窗口一闪，扫码框永远不出来」。不匹配就返回 $null，
+    # 让调用方退回一体包（自带一套对得上的 QQ）。
+    $qqnt = Join-Path $root 'qqnt.json'
+    if (Test-Path $qqnt) {
+        $want = ''
+        try { $want = [string](Get-Content $qqnt -Raw -Encoding UTF8 | ConvertFrom-Json).buildVersion } catch { }
+        $qq = Get-QqClientInfo
+        $have = ''
+        if ($qq -and $qq.Version -match '-(\d+)$') { $have = $matches[1] }
+        if ($want -and $have -and $want -ne $have) {
+            Warn ('这个 NapCat 只认 QQ build ' + $want + '，你机器上是 ' + $have)
+            Warn '版本差着就注入不进去，扫码框永远不出来'
+            return $null
+        }
+        if ($want -and $have) { Ok ('版本对得上：QQ build ' + $have) }
+    }
+
     Ok ('NapCat 已就位：' + $root)
     return $root
 }
@@ -1707,8 +1747,14 @@ function Find-NapCat {
     if (Test-Path $onekey) {
         # Shell 包装出来的：BootMain 直接在这一层，没有子目录
         if (Test-Path (Join-Path $onekey 'NapCatWinBootMain.exe')) {
-            if (-not $ExistingOnly) { Ok ('使用已装好的 NapCat（Shell 包）：' + $onekey) }
-            return $onekey
+            if (Test-NapCatQqBuild $onekey) {
+                if (-not $ExistingOnly) { Ok ('使用已装好的 NapCat（Shell 包）：' + $onekey) }
+                return $onekey
+            }
+            if (-not $ExistingOnly) {
+                Warn ('已装的那份 NapCat 和你的 QQ 版本对不上：' + $onekey)
+                Warn '不重装就永远注入不进去，下面换一条路'
+            }
         }
         $ready = @(Get-ChildItem $onekey -Directory -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -match '^NapCat\.[\d.]+\.Shell$' } |
@@ -1735,7 +1781,11 @@ function Find-NapCat {
     }
     $good = @()
     foreach ($c in @($candidates | Select-Object -Unique)) {
-        if (Test-NapCatRoot $c) { $good += $c; continue }
+        if (Test-NapCatRoot $c) {
+            if (Test-NapCatQqBuild $c) { $good += $c }
+            elseif (-not $ExistingOnly) { Warn ('跳过版本对不上的 NapCat：' + $c) }
+            continue
+        }
         $parent = Split-Path $c -Parent
         if ($parent -and (Test-NapCatRoot $parent)) { $good += $parent }
     }
@@ -2047,6 +2097,12 @@ function Get-NapCatLauncher([string]$NapCatPath) {
     $boot = Join-Path $NapCatPath 'NapCatWinBootMain.exe'
     if (-not (Test-Path $boot)) { return $boot }
 
+    # 官方 launcher 会把 QQ 路径、注入 DLL、napcat.mjs 拼好再调 bootmain。
+    # 直接跑 35 KB 的 bootmain，它只会打印一行 arg[0] 就退出（客户看到 NapCat 窗口一闪）。
+    foreach ($name in @('launcher-win10.bat', 'launcher.bat', 'napcat.bat')) {
+        $cand = Join-Path $NapCatPath $name
+        if (Test-Path $cand) { return $cand }
+    }
     $wrapper = Join-Path $NapCatPath 'start-napcat-utf8.cmd'
     try {
         $content = "@echo off`r`nchcp 65001 >nul`r`ncd /d `"%~dp0`"`r`n`"%~dp0NapCatWinBootMain.exe`"`r`n"
