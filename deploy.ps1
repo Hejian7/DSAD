@@ -70,12 +70,18 @@ $script:AppName = 'DSH-QQ 一键部署'
 #   ds-as-nap\uv\        uv 单个可执行文件
 #   ds-as-nap\logs\      日志
 # 安装根目录：默认是本脚本旁边的 ds-as-nap\。
-# 但入口脚本（install-basic/plus）会把本脚本下到 ds-as-nap\_install\ 里再执行，
-# 那时按 $PSScriptRoot 推会套成 _install\ds-as-nap\，所以入口脚本会显式传 -InstallRoot。
+# 但入口脚本会把本脚本下到 ds-as-nap\_install\ 里再执行，那时按 $PSScriptRoot 硬拼
+# 会套成 _install\ds-as-nap\。所以看见自己在 _install 里就往上退一层——
+# 这样不管谁调的、传没传 -InstallRoot，路径都对得上。
 if ($InstallRoot) {
     $script:AsRoot = $InstallRoot
 } elseif ($PSScriptRoot) {
-    $script:AsRoot = Join-Path $PSScriptRoot 'ds-as-nap'
+    $parent = Split-Path $PSScriptRoot -Parent
+    if ((Split-Path $PSScriptRoot -Leaf) -eq '_install' -and (Split-Path $parent -Leaf) -eq 'ds-as-nap') {
+        $script:AsRoot = $parent
+    } else {
+        $script:AsRoot = Join-Path $PSScriptRoot 'ds-as-nap'
+    }
 } else {
     $script:AsRoot = Join-Path (Get-Location).Path 'ds-as-nap'
 }

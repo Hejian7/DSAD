@@ -306,9 +306,6 @@ cmd 对 LF 是硬伤）。拉不到也不影响安装：`deploy.ps1` 一开始�
 
 ## 双击就能用（不用碰 PowerShell）
 
-仓库根目录里这些 `.cmd` 是给「把仓库 clone 下来、直接跑 `deploy.ps1`」的人用的，
-前提是 `deploy.ps1` 和它们在同一层：
-
 | 双击这个 | 作用 |
 | --- | --- |
 | `一键部署.cmd` | 第一次部署：装 AstrBot / NapCat、写配置、起服务、出二维码 |
@@ -320,10 +317,13 @@ cmd 对 LF 是硬伤）。拉不到也不影响安装：`deploy.ps1` 一开始�
 | `查看日志.cmd` | 实时跟日志（Ctrl+C 退出） |
 | `卸载.cmd` | 卸装：可选只删 AstrBot / NapCat / 插件 / 全删 |
 
-每个 `.cmd` 只是三行壳，实际都调用 `deploy.ps1 -Action <名字>`；
+每个 `.cmd` 只是层壳，实际都调用 `deploy.ps1 -Action <名字>`；
 喜欢命令行的也可以直接：`.\deploy.ps1 -Action Status`
 
-> 客户走「安装-基础版 / 升级版」那条路时，`deploy.ps1` 是装进 `ds-as-nap\_install\` 的，
-> 跟这些 `.cmd` 不同层。所以客户手里只有安装脚本时，启动 / 停止 / 看状态得直接写：
-> `powershell -NoProfile -ExecutionPolicy Bypass -File ds-as-nap\_install\deploy.ps1 -Action Start`
-> （`Stop` / `Status` / `Backup` / `Logs` 同理）。
+**它们会自己找 `deploy.ps1`**，顺序是：本层 → 本层 `ds-as-nap\_install\` →
+上一层 → 上一层 `ds-as-nap\_install\` → 上两层。所以不管你是 clone 了整个仓库，
+还是只拿了两个安装脚本、把 `deploy.ps1` 落在 `ds-as-nap\_install\` 里，
+这些 `.cmd` 都能直接双击用。一个都找不到时会明说它找过哪几个位置，不闷声失败。
+
+> `deploy.ps1` 那边也有对应的自愈：发现自己在 `ds-as-nap\_install\` 里，就把安装根往上退一层，
+> 不会出现 `_install\ds-as-nap\` 这种套娃目录。
