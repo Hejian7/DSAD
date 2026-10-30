@@ -619,7 +619,11 @@ function Wait-ProcessWithProgress {
             } elseif ($done -gt 0) {
                 $beat += (' ｜ 已处理 ' + $done + ' 个包')
             } elseif ($LogPath) {
-                $beat += ' ｜ 正在解析依赖（这一步慢是常态）'
+                if ($LogPath -and (Test-Path $LogPath) -and (Get-Item $LogPath).Length -eq 0) {
+                    $beat += ' ｜ 还在跑（这个安装器不打印进度）'
+                } else {
+                    $beat += ' ｜ 正在解析依赖（这一步慢是常态）'
+                }
             }
             if ($line) {
                 $short = $line
@@ -1566,6 +1570,8 @@ function Test-NapCatSelfContained([string]$Root) {
 # 这份 NapCat 能不能配这台机器的 QQ：比 qqnt.json 的 buildVersion 和 QQ 的 build 号。
 # 拿不准的一律放行（没有清单、没有 QQ、解析不出来），只在"明确对不上"时返回 false。
 function Test-NapCatQqBuild([string]$NapCatPath) {
+    # 一体包自带一整套 QQ，版本天生自洽，不该跟机器上那个比
+    if (Test-NapCatSelfContained $NapCatPath) { return $true }
     $qqnt = Join-Path $NapCatPath 'qqnt.json'
     if (-not (Test-Path $qqnt)) { return $true }
     $want = ''
@@ -1716,9 +1722,8 @@ function Install-NapCatShell {
         $have = ''
         if ($qq -and $qq.Version -match '-(\d+)$') { $have = $matches[1] }
         if ($want -and $have -and $want -ne $have) {
-            Warn ('这个 NapCat 只认 QQ build ' + $want + '，你机器上是 ' + $have)
-            Warn '版本差着就注入不进去，扫码框永远不出来'
-            return $null
+            Warn ('注意：这份 NapCat 标称配 QQ build ' + $want + '，你机器上是 ' + $have)
+            Warn '版本差着有概率注入失败，但先试这个（34 MB）——不行再退回一体包（334 MB）'
         }
         if ($want -and $have) { Ok ('版本对得上：QQ build ' + $have) }
     }
@@ -2856,10 +2861,47 @@ function Invoke-ActionStart {
     exit 0
 }
 
+# 停服务时顺带清掉"多出来的"QQ：NapCat 拉起来的那个（机器人号）要杀，
+# 你自己开着的那个（主人号）必须留着——不然一按停止，你正聊着的 QQ 也没了。
+# 区分办法不看 QQ 号（命令行里根本没有），看「谁把它拉起来的」：
+#   你自己双击的   → 父进程 explorer
+#   NapCat 拉起的  → 父进程 NapCatWinBootMain；bootmain 先退了就成孤儿，父进程找不到
+# 后两种都算该杀的。
+function Stop-LeftoverQq {
+    $keepParents = @('explorer', 'StartMenuExperienceHost', 'ShellExperienceHost')
+    $killed = 0
+    $kept = 0
+
+    # 只看主进程（Electron 的 renderer/gpu/utility 都带 --type=，别一个个去杀）
+    $mains = @(Get-CimInstance Win32_Process -Filter "Name='QQ.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -and $_.CommandLine -notmatch '--type=' })
+
+    foreach ($q in $mains) {
+        $parentName = ''
+        try {
+            $pp = Get-CimInstance Win32_Process -Filter ('ProcessId=' + [int]$q.ParentProcessId) -ErrorAction SilentlyContinue
+            if ($pp) { $parentName = [string]$pp.Name }
+        } catch { }
+        $parentBase = $parentName -replace '\.exe$', ''
+
+        if ($keepParents -contains $parentBase) { $kept++; continue }
+
+        try {
+            cmd /c ('taskkill /F /T /PID ' + $q.ProcessId) 2>&1 | Out-Null
+            $killed++
+        } catch { }
+    }
+
+    if ($killed -gt 0) { Ok ('清掉了 ' + $killed + ' 个多余的 QQ（NapCat 拉起来的）') }
+    if ($kept -gt 0) { Info ($kept.ToString() + ' 个你自己开的 QQ 没动') }
+    return $killed
+}
+
 function Invoke-ActionStop {
     Step '停止' '把服务关掉（数据保留）'
     if (Stop-AstrBot) { Ok 'AstrBot 已停止' } else { Info 'AstrBot 本来没在跑' }
     if (Stop-AllNapCat) { Ok 'NapCat 已停止' } else { Info 'NapCat 本来没在跑' }
+    Stop-LeftoverQq | Out-Null
     say_stop_tip
     exit 0
 }
