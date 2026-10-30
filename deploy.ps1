@@ -2380,7 +2380,7 @@ function Ensure-UninstallEntry {
         'setlocal',
         'cd /d "%~dp0"',
         '',
-        'rem 想只卸某个组件，给参数：-UninstallTarget 1=AstrBot 2=NapCat 3=插件 4=全删',
+        'rem 想只删某个组件：把最后那行的 %* 换成 -UninstallTarget 1（1=AstrBot 2=NapCat 3=插件 4=全删）',
         'set "PS1=%~dp0ds-as-nap\_install\deploy.ps1"',
         'if exist "%PS1%" goto run',
         '',
