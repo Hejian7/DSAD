@@ -30,7 +30,7 @@ pause
 exit /b 1
 
 :run
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%PS1%" -Action Deploy
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%PS1%" -Action Deploy -EntryKey DSH-QQ-7f3a9c2e
 set RESULT=%ERRORLEVEL%
 echo.
 pause

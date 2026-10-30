@@ -53,10 +53,32 @@ param(
     [string]$UninstallTarget = 'ask',
     [switch]$Yes,
     [switch]$DryRun,
-    [switch]$Quiet
+    [switch]$Quiet,
+    [string]$EntryKey = ''
 )
 
 $ErrorActionPreference = 'Stop'
+
+# ── 入口口令 ───────────────────────────────────────────────────────────────
+# 安装-*.cmd / 一键部署.cmd 这些入口会带着它来调本脚本。
+# 先说清它的分量：挡不住真想用的人——脚本就躺在客户机器上，打开就能看见这一行。
+# 它只把"顺手抄一份去用"变成"得先翻代码找口令"，对防随手白嫖够用了。
+# 只拦「部署」：查状态、启动、停止照常跑，免得哪个入口漏传口令把自己锁死。
+$script:EntryKeyExpected = 'DSH-QQ-7f3a9c2e'
+
+# 注意：这里只能用 Write-Host，不能用 Say —— Say 要等到函数定义那一段才注册，
+# 这段跑在它前头。
+if ($Action -eq 'Deploy' -and -not $Preflight -and -not $Probe -and -not $SelfCheck -and $EntryKey -ne $script:EntryKeyExpected) {
+    Write-Host ''
+    Write-Host '  ──────────────────────────────────────────────' -ForegroundColor Yellow
+    Write-Host '  这个脚本要通过安装入口启动。' -ForegroundColor Yellow
+    Write-Host ''
+    Write-Host '  双击「安装-基础版.cmd」或「安装-升级版.cmd」，它们会带着口令来调它。' -ForegroundColor Yellow
+    Write-Host '  （真要手动跑，加 -EntryKey 把口令带上。）' -ForegroundColor DarkGray
+    Write-Host '  ──────────────────────────────────────────────' -ForegroundColor Yellow
+    Write-Host ''
+    exit 1
+}
 # 不用 Write-Progress。它在 chcp 65001 + 中文环境里按"字符数"算宽度，
 # 汉字占两格，重绘时擦不干净，结果就是客户看到的文字叠文字。
 # 进度一律改成往下滚的一行行文本：难看一点，但任何终端都不糊。
