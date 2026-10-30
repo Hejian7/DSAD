@@ -72,7 +72,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy.ps1
 
 **2. 全程有进度**
 - 下载：字节级进度条（`12.3/20.3 MB 61% 1.8 MB/s`），支持断点重试、可选 sha256 校验。
-- 装 AstrBot / 装 NapCat：显示已用时间 + **日志最后一行的实时尾巴**，不再是黑屏干等十几分钟。
+- 装 AstrBot / 建 venv / 装 NapCat：三层反馈一起上——顶部进度条（已用时间 + 已下 MB +
+  包数 / 当前那个包）、**每 20 秒一行带时间戳的滚动心跳**、标题栏同步阶段。
+  进度条在某些终端里画不出来、或者窗口被最小化过，心跳那行还在，所以"看着像卡死"
+  这件事基本被堵死了。
+- 网真死了也不干等：日志连续 4 分钟一个字没长，就判定这条连接废了，杀掉换下一个 PyPI 镜像。
 - 标题栏同步显示当前阶段，最小化也能知道在干嘛。
 
 **3. 装一半被关掉？**
@@ -85,6 +89,60 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy.ps1
 > 内部约定：本脚本**不要用 `Invoke-WebRequest @参数表`（splatting）**。实测在装了安全软件的
 > 机器上，这种写法会让 PowerShell 5.1 无声无息整个退出（退出码 0、没有任何报错），极难排查。
 > 网络请求统一走 `HttpWebRequest`。
+
+---
+
+## 客户手里只有三个 .cmd
+
+**仓库里不放安装入口。** 仓库只当拉取源，客户拿到的是发布目录里这三个文件：
+
+| 文件 | 干什么 |
+| --- | --- |
+| `安装-基础版.cmd` | 拉 `deploy.ps1` → 装 AstrBot + NapCat |
+| `安装-升级版.cmd` | 多拉 `plugin\`（Almost perfect 看门狗插件） |
+| `卸载.cmd` | 调 `deploy.ps1 -Uninstall`，可选只删某个组件 |
+
+两个安装脚本都会**顺带把 `卸载.cmd` 拉到同一层**（拉下来的如果是 LF 换行会被重写成 CRLF，
+cmd 对 LF 是硬伤）。拉不到也不影响安装：`deploy.ps1` 一开始部署就会在安装根旁边补一份
+（`Ensure-UninstallEntry`）。**装得进去就一定要卸得掉。**
+
+### 基础版和升级版差在哪
+
+| | 基础版 | 升级版 |
+| --- | --- | --- |
+| `deploy.ps1` | ✔ | ✔ |
+| `plugin\install-plugin.ps1` | ✘ | ✔ |
+| `plugin\almost_perfect\`（main.py / metadata.yaml / repair.ps1 / settings.json / README.md） | ✘ | ✔ |
+| AstrBot + 独立 venv + Python 3.12 | ✔ | ✔ |
+| NapCat 一体包（自带 QQ） | ✔ | ✔ |
+| 第 7.5 步「装选装插件」 | 跳过 | 执行 |
+| 卸载 | ✔ | ✔ |
+
+两版**共用同一份 `deploy.ps1`**，判据只有一个：包里有没有 `plugin\install-plugin.ps1`。
+没有就打一行「基础版：包里没有插件安装器，跳过选装插件」，然后照常往下走。
+所以不会分叉，也不用维护两份部署逻辑。
+
+---
+
+## 被杀软拦这件事
+
+这套部署在杀软眼里几乎每一步都像坏事：下 exe、建 venv、往 QQ 进程里注入、写计划任务。
+360 / 火绒 / 电脑管家 / Defender 都可能插手。典型症状：
+
+- 下载到一半没声了，日志里半天没有新行
+- `venv` 目录建了一半，或者压根没有 `Scripts\python.exe`
+- `uv` 返回 0，但 `Scripts\astrbot.exe` 不在
+- 扫完码 QQ 闪退 / 一直转圈
+
+脚本会在第 1 步报一次检测到的安全软件（安全中心 + 进程名兜底），并给出该加白的路径。
+真遇上了：
+
+1. 把安装根 `ds-as-nap\` 整个目录加进白名单；
+2. 或者临时关掉实时防护；
+3. 重跑安装脚本——已经装好的部分会接着装，不会白装。
+
+`venv` 建不出来、`pip` 报「拒绝访问 / being used by another process」的时候，
+脚本会直接点名「大概率是杀软」，而不是甩一句看不懂的退出码。
 
 ---
 
@@ -248,6 +306,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy.ps1
 
 ## 双击就能用（不用碰 PowerShell）
 
+仓库根目录里这些 `.cmd` 是给「把仓库 clone 下来、直接跑 `deploy.ps1`」的人用的，
+前提是 `deploy.ps1` 和它们在同一层：
+
 | 双击这个 | 作用 |
 | --- | --- |
 | `一键部署.cmd` | 第一次部署：装 AstrBot / NapCat、写配置、起服务、出二维码 |
@@ -257,6 +318,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy.ps1
 | `状态.cmd` | 四项自检：端口 / AstrBot / NapCat / 两端连接 |
 | `备份数据.cmd` | 打包配置与聊天数据，保留最近 10 份 |
 | `查看日志.cmd` | 实时跟日志（Ctrl+C 退出） |
+| `卸载.cmd` | 卸装：可选只删 AstrBot / NapCat / 插件 / 全删 |
 
 每个 `.cmd` 只是三行壳，实际都调用 `deploy.ps1 -Action <名字>`；
 喜欢命令行的也可以直接：`.\deploy.ps1 -Action Status`
+
+> 客户走「安装-基础版 / 升级版」那条路时，`deploy.ps1` 是装进 `ds-as-nap\_install\` 的，
+> 跟这些 `.cmd` 不同层。所以客户手里只有安装脚本时，启动 / 停止 / 看状态得直接写：
+> `powershell -NoProfile -ExecutionPolicy Bypass -File ds-as-nap\_install\deploy.ps1 -Action Start`
+> （`Stop` / `Status` / `Backup` / `Logs` 同理）。
