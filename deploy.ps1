@@ -2534,7 +2534,7 @@ function Invoke-SelfCheck([int]$Port, $Target) {
     if ($ball.Count -gt 0) { Ok ('NapCat 进程在（PID ' + (($ball | ForEach-Object { $_.ProcessId }) -join ',') + '）') }
     else { Warn 'NapCat 进程不在'; $bad++ }
 
-    if (Get-NetTCPConnection -RemotePort $Port -State Established -ErrorAction SilentlyContinue) { Ok 'NapCat ↔ AstrBot 连接已建立' }
+    if (Get-NetTCPConnection -RemotePort $Port -State Established -ErrorAction SilentlyContinue) { Ok 'NapCat 和 AstrBot 连上了' }
     else { Warn '两边还没连上（没登录 / 端口不对 / token 不一致）'; $bad++ }
 
     if ($Target) { Info ('AstrBot 形态：' + $Target.Kind + '，配置：' + $Target.Config) }
@@ -2877,6 +2877,59 @@ function Invoke-ActionCheck {
     exit 0
 }
 
+# 面板密码保存在「面板密码.txt」里（部署时写的）。AstrBot 那边配置里存的是哈希，
+# 拿不回明文，所以启动时要显式把它捞出来给客户看——不然客户只知道地址不知道密码。
+function Get-SavedPanelPassword {
+    $p = Join-Path $script:Root '面板密码.txt'
+    if (-not (Test-Path $p)) { return '' }
+    try {
+        foreach ($line in (Get-Content $p -Encoding UTF8)) {
+            if ($line -match '密码一栏填：\s*(\S+)') { return $matches[1] }
+        }
+    } catch { }
+    return ''
+}
+
+# 启动完把两个面板都推到客户面前。
+# NapCat 那边能直接带 token 进（塞在 URL 参数里），AstrBot 那边只能填用户名密码。
+function Open-PanelsForCustomer {
+    $pw = Get-SavedPanelPassword
+    $napRoot = Get-AnyNapCatRoot
+    $napUrl = 'http://127.0.0.1:6099'
+    $napToken = ''
+    if ($napRoot) {
+        $web = Get-NapCatWebUi $napRoot
+        if ($web) {
+            if ($web.Url) { $napUrl = $web.Url }
+            if ($web.Token) { $napToken = $web.Token }
+        }
+    }
+
+    Say ''
+    Say '   ┌─ AstrBot 面板（要用户名和密码两栏）─────────────' 'Cyan'
+    Say '   │  地址：http://127.0.0.1:6185'
+    Say '   │  用户名一栏填：astrbot' 'Yellow'
+    if ($pw) { Say ('   │  密码一栏填：  ' + $pw) 'Yellow' }
+    else { Say '   │  密码：看 ds-as-nap\面板密码.txt（没有就重跑一次部署）' 'Yellow' }
+    Say '   └─────────────────────────────────────────────────' 'Cyan'
+
+    if ($napToken) {
+        Say ''
+        Say '   NapCat 面板不用手敲令牌，链接会自动填好。' 'DarkGray'
+        Open-Panel (Get-NapCatLoginUrl $napUrl $napToken) 'NapCat 面板'
+    }
+
+    Open-Panel 'http://127.0.0.1:6185' 'AstrBot 面板'
+
+    if ($pw) {
+        try {
+            Set-Clipboard -Value $pw
+            Say '   AstrBot 密码已经复制到剪贴板 —— 光标放进密码栏，Ctrl+V 就行。' 'Green'
+        } catch { }
+    }
+    Say ''
+}
+
 function Invoke-ActionStart {
     Step '启动' '把服务拉起来'
     $ab = Resolve-AstrBotExisting
@@ -2903,7 +2956,15 @@ function Invoke-ActionStart {
         Ok 'NapCat 已拉起'
     } else { Warn '没找到 NapCat：先跑一次「一键部署.cmd」' }
 
+    # 拉起来 ≠ 连上了。注入器要先把 QQ 拖起来、自动登录、再建 WS，十几秒起步；
+    # 不等这一步就自检，必然报「两边还没连上」，客户以为白装了。
+    if ($nap) {
+        if (Wait-NapCatConnected $port 90) { Ok 'NapCat 已连上 AstrBot' }
+        else { Warn 'NapCat 起来了，但 90 秒内没连上 AstrBot：去 6099 面板看它自己的连接状态' }
+    }
+
     Invoke-SelfCheck $port $ab | Out-Null
+    Open-PanelsForCustomer
     exit 0
 }
 
