@@ -68,7 +68,7 @@ $script:EntryKeyExpected = 'DSH-QQ-7f3a9c2e'
 
 # 注意：这里只能用 Write-Host，不能用 Say —— Say 要等到函数定义那一段才注册，
 # 这段跑在它前头。
-if ($Action -eq 'Deploy' -and -not $Preflight -and -not $Probe -and -not $SelfCheck -and $EntryKey -ne $script:EntryKeyExpected) {
+if ($Action -eq 'Deploy' -and -not $Preflight -and -not $Probe -and -not $SelfCheck -and -not $Uninstall -and $EntryKey -ne $script:EntryKeyExpected) {
     Write-Host ''
     Write-Host '  ──────────────────────────────────────────────' -ForegroundColor Yellow
     Write-Host '  这个脚本要通过安装入口启动。' -ForegroundColor Yellow
