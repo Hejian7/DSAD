@@ -211,9 +211,17 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy.ps1
 
 ---
 
-## NapCat：默认用「一体包」（自带 QQ）
+## NapCat：机器上有 QQ 就用 Shell 包，没有才下一体包
 
--NapCatMode auto（默认）：有能用的现成 NapCat 就用，没有就装一体包。
+`-NapCatMode auto`（默认）的判据：
+
+| 机器上有没有 QQ | 走哪条 | 要下多少 |
+| --- | --- | --- |
+| 有（注册表 / 进程 / 常见路径能认出来） | 官方 `NapCat.Shell.zip`，用你现成的 QQ | **约 34 MB** |
+| 没有 | 一体包，自带一整套 QQ | 约 0.95 MB + 300 MB + 34 MB |
+
+**为什么这么改**：那 300 MB 的 QQ 走 GitHub 在国内能干到十几分钟，34 MB 的 Shell 包几分钟就完了。
+机器上有 QQ 就别重复下一遍。
 
 **一体包实测数据**（本机跑通一次）：
 
@@ -225,9 +233,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy.ps1
 | 解压 + 复制 bootmain + 改 package.json | 约 1 分钟 |
 | 全程 | 约 6 分钟，**零交互** |
 
-装出来是 NapCat.<版本>.Shell\，里面自带一整套 QQ（ersions\<qq版本>-<build>\）和 NapCat，**客户机器上不需要预装 QQ**，也不存在“QQ 版本和 NapCat 对不上”的问题——脚本检测到自带 QQ 会自动跳过版本对比。
+装出来是 NapCat.<版本>.Shell\，里面自带一整套 QQ（versions\<qq版本>-<build>\）和 NapCat，**客户机器上不需要预装 QQ**，也不存在“QQ 版本和 NapCat 对不上”的问题——脚本检测到自带 QQ 会自动跳过版本对比。
 
--NapCatMode shell：走老路，只下不带 QQ 的 NapCat.Shell.zip，用客户自己的 QQ，这时才会做版本对齐检查。
+Shell 模式（机器上有 QQ 时自动选）：只下 `NapCat.Shell.zip`，用机器上那个 QQ，这时会做版本对齐检查。
+QQ 版本太新或太旧导致 NapCat 起不来，脚本会直接建议重跑加 `-NapCatMode onekey`。
+
+**下载源顺序**：`gh-proxy.com` → `ghproxy.net` → `ghfast.top` → GitHub 直连（预检探通了的排前面）。
+国内直连 GitHub 经常不通，`gh-proxy.com` 是实测还能用的那个。
 
 首次启动前 NapCat 还没有 config 目录，脚本会**自己建好并写入 onebot11_<QQ>.json**，所以第一次启动就带着 WS 客户端，不用先跑一遍再配。
 ---

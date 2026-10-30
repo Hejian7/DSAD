@@ -109,6 +109,7 @@ $script:InterruptRequested = $false
 $script:CtrlCGuardOn = $false
 $script:CtrlCStrikes = 0
 $script:GuardLoaded = $false
+$script:ConsoleModeOrig = $null
 $script:CurrentStage = ''
 $script:MarkerFile = Join-Path $script:Root '.install-in-progress.json'
 $script:LockFile = Join-Path $script:Root '.deploy.lock'
@@ -195,6 +196,40 @@ function Initialize-NetClient {
     }
 }
 
+# 国内镜像走代理只会更慢：本来几步就到的，非要绕一圈出国再回来，
+# 300 MB 能给你拖成半小时。这些域名一律直连，不走系统代理。
+# （公司网必须靠代理才能出站的场景除外——那种机器上直连也连不到，下面的重试会兜住。）
+$script:DomesticHosts = @(
+    'tuna.tsinghua.edu.cn',
+    'mirrors.aliyun.com',
+    'mirrors.ustc.edu.cn',
+    'mirrors.cernet.edu.cn',
+    'mirror.nju.edu.cn',
+    'mirrors.bfsu.edu.cn',
+    'mirrors.huaweicloud.com',
+    'mirrors.cloud.tencent.com',
+    'npmmirror.com',
+    'registry.npmmirror.com',
+    'docs.astrbot.app'
+)
+
+function Test-DomesticMirror([string]$Url) {
+    try {
+        $h = ([Uri]$Url).Host
+        foreach ($d in $script:DomesticHosts) {
+            if ($h -eq $d -or $h.EndsWith('.' + $d, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+        }
+    } catch { }
+    return $false
+}
+
+# 给一个请求决定要不要挂代理：境外站点挂，国内镜像不挂
+function Set-RequestProxy($Req, [string]$Url) {
+    if (-not $script:ProxyUrl) { return }
+    if (Test-DomesticMirror $Url) { $Req.Proxy = $null; return }
+    $Req.Proxy = New-Object System.Net.WebProxy($script:ProxyUrl, $true)
+}
+
 # 注意：这里刻意不用 Invoke-WebRequest 的 splatting（@参数表）。
 # 实测在装了安全软件的机器上，`Invoke-WebRequest @p` 会让 PowerShell 5.1
 # 无声无息地整个进程退出（退出码 0、无报错），排查成本极高。
@@ -209,7 +244,7 @@ function Test-Endpoint([string]$Url, [int]$TimeoutSec = 5, [switch]$Head, [switc
         $req.ReadWriteTimeout = $TimeoutSec * 1000
         $req.AllowAutoRedirect = $true
         if ($Head) { $req.Method = 'HEAD' }
-        if ($script:ProxyUrl) { $req.Proxy = New-Object System.Net.WebProxy($script:ProxyUrl, $true) }
+        Set-RequestProxy $req $Url
         $resp = $req.GetResponse()
         $code = [int]$resp.StatusCode
         $resp.Close()
@@ -265,13 +300,15 @@ function Get-LocalInventory {
     if ($ab) { Ok ('AstrBot：已装（' + $ab.Kind + '）' + $ab.Root) }
     else { Info 'AstrBot：没装 —— 走 PyPI 镜像直装，不碰 GitHub' }
 
+    $qq = Get-QqClientInfo
+    $inv.Qq = $qq
+
     $nap = Find-NapCat -ExistingOnly
     $inv.NapCat = $nap
     if ($nap) { $script:NapCatCache = $nap; Ok ('NapCat：已有 ' + $nap) }
-    else { Info 'NapCat：没有 —— 要下一体包（约 34 MB，外加 QQ 客户端 300 MB）' }
+    elseif ($qq) { Info 'NapCat：没有 —— 机器上已有 QQ，只下 Shell 包（约 34 MB）' }
+    else { Info 'NapCat：没有 —— 没找到 QQ 客户端，走一体包（约 34 MB 外壳 + 300 MB QQ）' }
 
-    $qq = Get-QqClientInfo
-    $inv.Qq = $qq
     if ($qq) { Ok ('QQ 客户端：' + $qq.Version + ' @ ' + $qq.Root) }
     else { Info 'QQ 客户端：没检测到（用一体包会自带，不用管）' }
 
@@ -311,6 +348,7 @@ function Test-NetworkProfile($Inventory) {
     if ($needNapCat) {
         $probes += [pscustomobject]@{ Key = 'github'; Name = 'GitHub 直连'; Url = 'https://github.com' }
         $probes += [pscustomobject]@{ Key = 'ghproxy'; Name = 'ghproxy 镜像'; Url = 'https://ghproxy.net' }
+        $probes += [pscustomobject]@{ Key = 'ghproxy2'; Name = 'gh-proxy 镜像'; Url = 'https://gh-proxy.com' }
     }
 
     $pypiFallbackTried = $false
@@ -352,8 +390,8 @@ function Test-NetworkProfile($Inventory) {
     if ($needPython -and -not $script:Net['python']) {
         Warn 'npmmirror 连不上：装 Python 3.12 那步可能很慢或者失败'
     }
-    if ($needNapCat -and -not $script:Net['github'] -and -not $script:Net['ghproxy']) {
-        Warn 'NapCat 直连和 ghproxy 都不通：到时候会提示你手动放安装包'
+    if ($needNapCat -and -not $script:Net['github'] -and -not $script:Net['ghproxy'] -and -not $script:Net['ghproxy2']) {
+        Warn 'NapCat 的三个源（GitHub 直连 / ghproxy / gh-proxy）都不通：到时候会提示你手动放安装包'
     }
 }
 
@@ -381,7 +419,7 @@ function Get-FileWithProgress {
             $req.UserAgent = 'DSH-Deploy/1.0'
             $req.Timeout = 20000
             $req.ReadWriteTimeout = $StallTimeoutSec * 1000
-            if ($script:ProxyUrl) { $req.Proxy = New-Object System.Net.WebProxy($script:ProxyUrl, $true) }
+            Set-RequestProxy $req $Url
 
             $resp = $req.GetResponse()
             try {
@@ -618,6 +656,9 @@ namespace DSHDeploy {
         [DllImport("user32.dll")] public static extern IntPtr GetSystemMenu(IntPtr hWnd, bool bRevert);
         [DllImport("user32.dll")] public static extern bool DeleteMenu(IntPtr hMenu, uint uPosition, uint uFlags);
         [DllImport("user32.dll")] public static extern bool DrawMenuBar(IntPtr hWnd);
+        [DllImport("kernel32.dll")] public static extern IntPtr GetStdHandle(int nStdHandle);
+        [DllImport("kernel32.dll")] public static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+        [DllImport("kernel32.dll")] public static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
     }
 }
 '@ -ErrorAction Stop
@@ -640,6 +681,31 @@ function Set-CloseButton([bool]$Enabled) {
             $null = [DSHDeploy.ConsoleGuard]::DeleteMenu($menu, 0xF060, 0)
             $null = [DSHDeploy.ConsoleGuard]::DrawMenuBar($h)
         }
+    } catch { }
+}
+
+# 客户在窗口里手一抖点了一下文字，控制台就进了"选择"模式：所有输出被冻住，
+# 程序看着像死了，按个键才活过来——这就是"莫名其妙停了"的真凶，跟网速没关系。
+# 把快速编辑关掉，从此点选不会再冻住输出。
+function Set-QuickEdit([bool]$Enabled) {
+    Initialize-ConsoleGuard
+    if (-not $script:GuardLoaded) { return }
+    try {
+        $h = [DSHDeploy.ConsoleGuard]::GetStdHandle(-10)   # STD_INPUT_HANDLE
+        if ($h -eq [IntPtr]::Zero -or $h -eq [IntPtr](-1)) { return }
+        $mode = [uint32]0
+        if (-not [DSHDeploy.ConsoleGuard]::GetConsoleMode($h, [ref]$mode)) { return }
+        if ($Enabled) {
+            if ($null -ne $script:ConsoleModeOrig) {
+                [void][DSHDeploy.ConsoleGuard]::SetConsoleMode($h, [uint32]$script:ConsoleModeOrig)
+            }
+            return
+        }
+        $script:ConsoleModeOrig = $mode
+        # 清掉 ENABLE_QUICK_EDIT_MODE(0x40)；顺带补上 ENABLE_EXTENDED_FLAGS(0x80)，
+        # 不加这一位，某些系统上改了不生效
+        $new = [uint32](($mode -band 0xFFFFFFBF) -bor 0x0080)
+        if ($new -ne $mode) { [void][DSHDeploy.ConsoleGuard]::SetConsoleMode($h, $new) }
     } catch { }
 }
 
@@ -885,7 +951,7 @@ function Get-TextWithTimeout([string]$Url, [int]$TimeoutSec = 20) {
     try {
         $req.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate
     } catch { }
-    if ($script:ProxyUrl) { $req.Proxy = New-Object System.Net.WebProxy($script:ProxyUrl, $true) }
+    if ($script:ProxyUrl) { Set-RequestProxy $req $Url }
     try {
         $resp = $req.GetResponse()
     } catch {
@@ -1507,6 +1573,7 @@ function Install-NapCatOneKey {
         if (-not $script:Net.ContainsKey('github') -or $script:Net['github']) {
             $mirrors += [pscustomobject]@{ Name = 'GitHub 直连'; Url = ('https://github.com/' + $onekeyPath) }
         }
+        $mirrors += [pscustomobject]@{ Name = 'gh-proxy'; Url = ('https://gh-proxy.com/https://github.com/' + $onekeyPath) }
         $mirrors += [pscustomobject]@{ Name = 'ghproxy'; Url = ('https://ghproxy.net/https://github.com/' + $onekeyPath) }
         $mirrors += [pscustomobject]@{ Name = 'ghfast'; Url = ('https://ghfast.top/https://github.com/' + $onekeyPath) }
         if (-not $script:Net.ContainsKey('github') -or $script:Net['github']) {
@@ -1566,6 +1633,56 @@ function Install-NapCatOneKey {
     return $installed[0].FullName
 }
 
+# 官方 Shell 包：只有 NapCat 本体，不带 QQ（34 MB 量级，官方文档的手动装法）。
+# 机器上已经有 QQ 时走这条，比一体包少下 300 MB。
+function Install-NapCatShell {
+    Step '3.1' '安装 NapCat（Shell 包，直接用现成的 QQ）'
+
+    $base = $script:NcDir
+    $zip = Join-Path $script:Root 'NapCat.Shell.zip'
+
+    if (-not (Test-Path $zip)) {
+        $shellPath = 'NapNeko/NapCatQQ/releases/latest/download/NapCat.Shell.zip'
+        $mirrors = @()
+        # 直连通不通，预检已经告诉过我们了，通的排前面
+        if (-not $script:Net.ContainsKey('github') -or $script:Net['github']) {
+            $mirrors += [pscustomobject]@{ Name = 'GitHub 直连'; Url = ('https://github.com/' + $shellPath) }
+        }
+        $mirrors += [pscustomobject]@{ Name = 'gh-proxy'; Url = ('https://gh-proxy.com/https://github.com/' + $shellPath) }
+        $mirrors += [pscustomobject]@{ Name = 'ghproxy'; Url = ('https://ghproxy.net/https://github.com/' + $shellPath) }
+        $mirrors += [pscustomobject]@{ Name = 'ghfast'; Url = ('https://ghfast.top/https://github.com/' + $shellPath) }
+        if (-not (Get-FileFromMirrors -Mirrors $mirrors -OutFile $zip)) {
+            Warn 'NapCat Shell 包没下下来'
+            return $null
+        }
+        if ((Get-Item $zip).Length -lt 100000) {
+            Warn '下到的 Shell 包太小，不像安装包'
+            Remove-Item $zip -Force -ErrorAction SilentlyContinue
+            return $null
+        }
+    } else {
+        Info ('复用安装包：' + $zip)
+    }
+
+    if (Test-Path $base) { Remove-Item $base -Recurse -Force -ErrorAction SilentlyContinue }
+    New-Item -ItemType Directory -Path $base -Force | Out-Null
+    try {
+        Expand-Archive -Path $zip -DestinationPath $base -Force
+    } catch {
+        Warn ('解压失败：' + $_.Exception.Message)
+        return $null
+    }
+
+    $boot = Get-ChildItem $base -Recurse -Filter 'NapCatWinBootMain.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $boot) {
+        Warn '解压后没找到 NapCatWinBootMain.exe'
+        return $null
+    }
+    $root = Split-Path $boot.FullName -Parent
+    Ok ('NapCat 已就位：' + $root)
+    return $root
+}
+
 function Find-NapCat {
     param([switch]$ExistingOnly)
 
@@ -1584,6 +1701,11 @@ function Find-NapCat {
 
     $onekey = $script:NcDir
     if (Test-Path $onekey) {
+        # Shell 包装出来的：BootMain 直接在这一层，没有子目录
+        if (Test-Path (Join-Path $onekey 'NapCatWinBootMain.exe')) {
+            if (-not $ExistingOnly) { Ok ('使用已装好的 NapCat（Shell 包）：' + $onekey) }
+            return $onekey
+        }
         $ready = @(Get-ChildItem $onekey -Directory -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -match '^NapCat\.[\d.]+\.Shell$' } |
             Where-Object { Test-Path (Join-Path $_.FullName 'NapCatWinBootMain.exe') } |
@@ -1633,39 +1755,57 @@ function Find-NapCat {
     # 只是清点家底时到此为止，绝不触发下载
     if ($ExistingOnly) { return $null }
 
-    if ($NapCatMode -eq 'shell') {
-        Warn '按 -NapCatMode shell：下载不带 QQ 的 NapCat（需要客户机器已有 QQ）'
-        $zip2 = Join-Path $script:Root 'NapCat.Shell.zip'
-        $shellMirrors = @(
-            [pscustomobject]@{ Name = 'GitHub 直连'; Url = 'https://github.com/NapNeko/NapCatQQ/releases/latest/download/NapCat.Shell.zip' },
-            [pscustomobject]@{ Name = 'ghproxy'; Url = 'https://ghproxy.net/https://github.com/NapNeko/NapCatQQ/releases/latest/download/NapCat.Shell.zip' },
-            [pscustomobject]@{ Name = 'ghfast'; Url = 'https://ghfast.top/https://github.com/NapNeko/NapCatQQ/releases/latest/download/NapCat.Shell.zip' }
-        )
-        if (-not (Get-FileFromMirrors -Mirrors $shellMirrors -OutFile $zip2)) {
-            Fail 'NapCat 下载失败（所有源都没通）' ('手动下 NapCat.Shell.zip 解压，再用 -NapCatDir 指过去。')
+    if ($NapCatMode -eq 'shell') { return (Install-NapCatShell) }
+
+    if ($NapCatMode -eq 'auto') {
+        # 机器上已经有 QQ，就别下那 300 MB 的一体包了。
+        # 官方 Shell 包只有 34 MB 左右，装完直接用现成的 QQ。
+        $qq = Get-QqClientInfo
+        if ($qq) {
+            Info ('机器上已经有 QQ ' + $qq.Version + '：' + $qq.Root)
+            Info '用官方 Shell 包（约 34 MB），省掉一体包里那 300 MB 的 QQ'
+            $r = Install-NapCatShell
+            if ($r) { return $r }
+            Warn '用现成 QQ 这条路没走通，退回一体包（要下 300 MB 左右）'
+        } else {
+            Info '没找到已安装的 QQ：用一体包，自带 QQ（约 300 MB）'
         }
-        $local = Join-Path $script:Root 'napcat'
-        if (Test-Path $local) { Remove-Item $local -Recurse -Force }
-        New-Item -ItemType Directory -Path $local -Force | Out-Null
-        Expand-Archive -Path $zip2 -DestinationPath $local -Force
-        $boot = Get-ChildItem $local -Recurse -Filter 'NapCatWinBootMain.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
-        if (-not $boot) { Fail 'NapCat 解压后没有 NapCatWinBootMain.exe' ('路径：' + $local) }
-        Ok ('NapCat 已部署：' + (Split-Path $boot.FullName -Parent))
-        return (Split-Path $boot.FullName -Parent)
     }
 
     return (Install-NapCatOneKey)
 }
 
+# QQ NT 装在哪，它自己在注册表里记着；注册表没有的再按常见路径兜。
+# （这地方以前硬编码过开发机的 D:\tools Software\QQ，换台机器就瞎了，别再那么干。）
 function Get-QqClientInfo {
-    $roots = @(
-        'D:\tools Software\QQ',
+    $roots = @()
+
+    foreach ($k in @(
+            'HKLM:\SOFTWARE\WOW6432Node\Tencent\QQNT',
+            'HKLM:\SOFTWARE\Tencent\QQNT',
+            'HKCU:\Software\Tencent\QQNT'
+        )) {
+        try {
+            $p = Get-ItemProperty $k -ErrorAction Stop
+            if ($p -and $p.Install) { $roots += [string]$p.Install }
+        } catch { }
+    }
+
+    # QQ 正在跑的话，进程路径最实在
+    try {
+        $qqProc = Get-Process -Name 'QQ' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($qqProc -and $qqProc.Path) { $roots += (Split-Path $qqProc.Path -Parent) }
+    } catch { }
+
+    $roots += @(
         "$env:ProgramFiles\Tencent\QQNT",
         "${env:ProgramFiles(x86)}\Tencent\QQNT",
         'C:\Program Files\Tencent\QQ',
         "$env:LOCALAPPDATA\Programs\Tencent\QQ"
     )
-    foreach ($r in $roots) {
+
+    foreach ($r in @($roots | Select-Object -Unique)) {
+        if (-not $r) { continue }
         $v = Join-Path $r 'versions'
         if (-not (Test-Path $v)) { continue }
         $dirs = @(Get-ChildItem $v -Directory -ErrorAction SilentlyContinue |
@@ -2176,7 +2316,7 @@ function Start-NapCat([string]$NapCatPath, [string]$ExpectQQ, [int]$Port, [switc
             Start-Process -FilePath $launcher -WorkingDirectory $NapCatPath | Out-Null
             Ok 'NapCat 已启动（会拉起 QQ 登录窗口，别关它）'
         } catch {
-            Fail 'NapCat 启动失败' ('错误：' + $_.Exception.Message + '`n路径：' + $boot + '`n可能是杀软拦了，把整个 NapCat 目录加白名单再试。')
+            Fail 'NapCat 启动失败' ('错误：' + $_.Exception.Message + '`n路径：' + $boot + '`n可能是杀软拦了，把整个 NapCat 目录加白名单再试。' + "`n如果用的是机器上现成的 QQ（Shell 包），也可能 QQ 版本和 NapCat 对不上：重跑加 -NapCatMode onekey，改用自带 QQ 的一体包。")
         }
     }
 
@@ -2564,8 +2704,9 @@ function Resolve-AstrBotExisting {
 function Get-AnyNapCatRoot {
     $onekey = $script:NcDir
     if (Test-Path $onekey) {
+        # Shell 包：BootMain 就在本层
+        if (Test-Path (Join-Path $onekey 'NapCatWinBootMain.exe')) { return $onekey }
         $ready = @(Get-ChildItem $onekey -Directory -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -match '^NapCat\.[\d.]+\.Shell$' -or (Test-Path (Join-Path $_.FullName 'NapCatWinBootMain.exe')) } |
             Where-Object { Test-Path (Join-Path $_.FullName 'NapCatWinBootMain.exe') } |
             Sort-Object LastWriteTime -Descending)
         if ($ready.Count -gt 0) { return $ready[0].FullName }
@@ -2717,6 +2858,8 @@ try {
 
     Initialize-NetClient
     Enable-CtrlCGuard
+    # 关掉控制台快速编辑：客户在窗口里点一下文字，输出就会被冻住，看着像卡死
+    Set-QuickEdit $false
 
     if ($Uninstall) {
     # 卸载会把安装目录整个删掉，日志不能写在里面，改到临时目录
@@ -2999,5 +3142,6 @@ catch {
 finally {
     # 无论如何把关闭按钮还回去，别让客户对着关不掉的窗口发呆；锁也要放掉
     Set-CloseButton $true
+    Set-QuickEdit $true
     Exit-DeployLock
 }
