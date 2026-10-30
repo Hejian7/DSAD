@@ -57,8 +57,11 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-# 进度条用 Write-Progress 原地重绘（不再用 \r 覆写，那样中文会重影）
-$ProgressPreference = 'Continue'
+# 不用 Write-Progress。它在 chcp 65001 + 中文环境里按"字符数"算宽度，
+# 汉字占两格，重绘时擦不干净，结果就是客户看到的文字叠文字。
+# 进度一律改成往下滚的一行行文本：难看一点，但任何终端都不糊。
+# SilentlyContinue 顺手把 PowerShell 内置 cmdlet 的进度条也一起关掉。
+$ProgressPreference = 'SilentlyContinue'
 
 # ── 常量 ───────────────────────────────────────────────────────────────────
 $script:AppName = 'DSH-QQ 一键部署'
@@ -388,6 +391,7 @@ function Get-FileWithProgress {
                 $buf = New-Object byte[] 65536
                 $done = 0L
                 $lastPaint = [DateTime]::MinValue
+                $lastPct = -100
                 $sw = [Diagnostics.Stopwatch]::StartNew()
                 try {
                     while ($true) {
@@ -397,26 +401,32 @@ function Get-FileWithProgress {
                         $out.Write($buf, 0, $n)
                         $done += $n
                         $now = Get-Date
-                        if (($now - $lastPaint).TotalSeconds -ge 1) {
+                        $mb = $done / 1MB
+                        $spd = 0.0
+                        if ($sw.Elapsed.TotalSeconds -gt 0.5) { $spd = ($done / 1MB) / $sw.Elapsed.TotalSeconds }
+                        $pct = -1
+                        if ($total -gt 0) { $pct = [int](100 * $done / $total) }
+
+                        # 不原地重绘：中文在那儿擦不干净。每 3 秒、或百分比动了 10 格，
+                        # 就老老实实滚一行——客户只要看见数字在变，就知道没卡死。
+                        $print = $false
+                        if ($pct -ge 0) {
+                            if (($now - $lastPaint).TotalSeconds -ge 3 -or ($pct - $lastPct) -ge 10) { $print = $true }
+                        } elseif (($now - $lastPaint).TotalSeconds -ge 3) {
+                            $print = $true
+                        }
+                        if ($print) {
                             $lastPaint = $now
-                            $mb = $done / 1MB
-                            $spd = 0.0
-                            if ($sw.Elapsed.TotalSeconds -gt 0.5) { $spd = ($done / 1MB) / $sw.Elapsed.TotalSeconds }
-                            if ($total -gt 0) {
-                                $pct = [int](100 * $done / $total)
-                                if (-not $Quiet) {
-                                    Write-Progress -Id 10 -Activity ('下载 ' + $Label) `
-                                        -Status ("{0:N1} / {1:N1} MB    {2}%    {3:N1} MB/s" -f $mb, ($total / 1MB), $pct, $spd) `
-                                        -PercentComplete $pct
+                            $lastPct = $pct
+                            if (-not $Quiet) {
+                                if ($pct -ge 0) {
+                                    Write-Host ('      {0,6:N1} / {1:N1} MB   {2,3}%   {3,4:N1} MB/s' -f $mb, ($total / 1MB), $pct, $spd) -ForegroundColor DarkGray
+                                } else {
+                                    Write-Host ('      {0,6:N1} MB   {1,4:N1} MB/s' -f $mb, $spd) -ForegroundColor DarkGray
                                 }
-                                Set-WindowTitle ('下载 ' + $Label + ' ' + $pct + '%')
-                            } else {
-                                if (-not $Quiet) {
-                                    Write-Progress -Id 10 -Activity ('下载 ' + $Label) `
-                                        -Status ("已下载 {0:N1} MB    {1:N1} MB/s" -f $mb, $spd) -PercentComplete -1
-                                }
-                                Set-WindowTitle ('下载 ' + $Label + ' ' + ('{0:N1}' -f $mb) + ' MB')
                             }
+                            if ($pct -ge 0) { Set-WindowTitle ('下载 ' + $Label + ' ' + $pct + '%') }
+                            else { Set-WindowTitle ('下载 ' + $Label + ' ' + ('{0:N1}' -f $mb) + ' MB') }
                         }
                     }
                 } finally {
@@ -432,10 +442,8 @@ function Get-FileWithProgress {
             }
             if (Test-Path $OutFile) { Remove-Item $OutFile -Force -ErrorAction SilentlyContinue }
             Move-Item $tmp $OutFile -Force
-            Write-Progress -Id 10 -Activity ('下载 ' + $Label) -Completed
             return $true
         } catch {
-            Write-Progress -Id 10 -Activity ('下载 ' + $Label) -Completed
             if ($script:InterruptRequested) { throw }
             if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
             # 代理最坑：注册表里配着、进程早死了。显式挂一个死代理会让所有请求全灭。
@@ -491,19 +499,15 @@ function Read-LogTail([string]$Path, [int]$Lines = 1) {
     } catch { return @() }
 }
 
-# 子进程跑到一半的"进度"。三层一起给，缺一层客户就会以为卡死：
-#   1) 顶部进度条：已用时间 + 已下体积 + 包数 + 当前那行，每秒原地重绘；
-#   2) 每 20 秒往屏幕上滚一行纯文本心跳 —— 有人把窗口最小化过，或者
-#      Write-Progress 在某些终端里根本画不出来，好歹还有条在动的记录；
-#   3) 卡死就换路：StallSec 秒日志一个字没长，直接杀掉让调用方换镜像，
-#      别拿 30 分钟总超时去赌一个已经死掉的连接。
+# 子进程跑到一半的"进度"，只做一件事：每几秒往下滚一行文字。
+# 不再原地重绘——Write-Progress 在中文 + chcp 65001 下擦不干净，会糊成一团。
+# 滚动的代价是刷屏，好处是绝对不糊；而且"最后一行一直在变"本身就是最好的存活证明。
+# 卡死也照旧换路：StallSec 秒日志一个字没长，直接杀掉让调用方换镜像。
 # 返回：真实退出码 / -2 超时 / -3 卡死 / -1 拿不到退出码（未知，交给调用方按副作用判断）
 function Wait-ProcessWithProgress {
-    param($Process, [string]$Label, [int]$TimeoutSec = 900, [string]$LogPath = '', [int]$StallSec = 0, [int]$BeatSec = 20)
+    param($Process, [string]$Label, [int]$TimeoutSec = 900, [string]$LogPath = '', [int]$StallSec = 0, [int]$BeatSec = 8)
 
     $sw = [Diagnostics.Stopwatch]::StartNew()
-    $lastShown = ''
-    $lastPrint = -10
     $lastBeat = -$BeatSec
     $lastMove = 0
     $lastLine = ''
@@ -516,7 +520,6 @@ function Wait-ProcessWithProgress {
         $elapsed = [int]$sw.Elapsed.TotalSeconds
         if ($elapsed -gt $TimeoutSec) {
             try { $Process.Kill() } catch { }
-            Write-Progress -Id 11 -Activity $Label -Completed
             return -2
         }
         $t = '{0:00}:{1:00}' -f [math]::Floor($elapsed / 60), ($elapsed % 60)
@@ -565,46 +568,13 @@ function Wait-ProcessWithProgress {
         # 卡死检测：真死掉的连接不会自己好，早点杀掉换源，比干等到总超时强
         if ($StallSec -gt 0 -and ($elapsed - $lastMove) -ge $StallSec) {
             try { $Process.Kill() } catch { }
-            Write-Progress -Id 11 -Activity $Label -Completed
             return -3
         }
 
-        # 原地重绘：不刷屏，也不会把中文画坏
-        if (($elapsed - $lastPrint) -ge 1 -or ($line -and $line -ne $lastShown)) {
-            $lastPrint = $elapsed
-            $lastShown = $line
-            if (-not $Quiet) {
-                $parts = @('已用 ' + $t)
-                if ($mb -gt 0) { $parts += ('已下 {0:N0} MB' -f $mb) }
-                if ($totalPkgs -gt 0) {
-                    $parts += ('{0}/{1} 个包' -f [Math]::Min($done, $totalPkgs), $totalPkgs)
-                } elseif ($done -gt 0) {
-                    $parts += ('已处理 ' + $done + ' 个包')
-                } else {
-                    $parts += '正在解析依赖'
-                }
-                if ($line) {
-                    $short = $line
-                    if ($short.Length -gt 46) { $short = $short.Substring(0, 46) + '…' }
-                    $parts += $short
-                }
-                $status = ($parts -join '  ·  ')
-                if ($status.Length -gt 110) { $status = $status.Substring(0, 110) }
-                $pct = -1
-                if ($totalPkgs -gt 0) {
-                    $pct = [int](100 * [Math]::Min($done, $totalPkgs) / $totalPkgs)
-                    if ($pct -gt 99) { $pct = 99 }
-                    if ($pct -lt 0) { $pct = 0 }
-                }
-                Write-Progress -Id 11 -Activity $Label -Status $status -PercentComplete $pct
-            }
-        }
-
-        # 滚动心跳：客户去泡了杯茶回来，看到的应该是"还在动"，不是一条冻住的条
+        # 一行，就一行。客户去泡了杯茶回来，看到的是"还在动"，不是一条冻住的东西。
         if (-not $Quiet -and $BeatSec -gt 0 -and ($elapsed - $lastBeat) -ge $BeatSec) {
             $lastBeat = $elapsed
-            Write-Progress -Id 11 -Activity $Label -Completed
-            $beat = '    … ' + $Label + ' 已用 ' + $t
+            $beat = '    · ' + $Label + ' 已用 ' + $t
             if ($mb -gt 0) { $beat += (' ｜ 已下 {0:N0} MB' -f $mb) }
             if ($totalPkgs -gt 0) {
                 $beat += (' ｜ {0} / {1} 个包' -f [Math]::Min($done, $totalPkgs), $totalPkgs)
@@ -613,14 +583,17 @@ function Wait-ProcessWithProgress {
             } elseif ($LogPath) {
                 $beat += ' ｜ 正在解析依赖'
             }
-            if ($line) { $beat += (' ｜ ' + $line) }
+            if ($line) {
+                $short = $line
+                if ($short.Length -gt 50) { $short = $short.Substring(0, 50) + '…' }
+                $beat += (' ｜ ' + $short)
+            }
             if (($elapsed - $lastMove) -ge 120) { $beat += ' ｜（两分钟没新动静：多半是网慢，脚本没死）' }
             Write-Host $beat -ForegroundColor DarkGray
             Write-Log $beat
         }
         Start-Sleep -Milliseconds 900
     }
-    Write-Progress -Id 11 -Activity $Label -Completed
 
     # PS 5.1 的坑：Start-Process -PassThru 不配 -Wait 时，ExitCode 常常是 $null
     try { $null = $Process.WaitForExit(5000) } catch { }
@@ -1098,14 +1071,10 @@ function Sort-IndexesBySpeed([string[]]$Indexes) {
     $i = 0
     foreach ($idx in $Indexes) {
         $i++
-        if (-not $Quiet) {
-            Write-Progress -Id 13 -Activity '挑选最快的 PyPI 镜像' -Status $idx `
-                -PercentComplete ([int](100 * ($i - 1) / $Indexes.Count))
-        }
+        if (-not $Quiet) { Info ('测速（' + $i + '/' + $Indexes.Count + '）：' + $idx) }
         $ms = Get-IndexSpeed $idx
         $scored += [pscustomobject]@{ Url = $idx; Ms = $ms }
     }
-    Write-Progress -Id 13 -Activity '挑选最快的 PyPI 镜像' -Completed
 
     $sorted = @($scored | Sort-Object Ms | ForEach-Object { $_.Url })
     $best = $scored | Sort-Object Ms | Select-Object -First 1
@@ -1632,16 +1601,12 @@ function Find-NapCat {
     foreach ($r in $searchRoots) {
         $ri++
         if (-not (Test-Path $r)) { continue }
-        # 扫目录可能要几秒，给个进度，别让人以为卡死了
-        if (-not $Quiet) {
-            Write-Progress -Id 12 -Activity '查找机器上已有的 NapCat' -Status ($r) `
-                -PercentComplete ([int](100 * $ri / $searchRoots.Count))
-        }
+        # 扫目录可能要几秒，逐行说一句，别让人以为卡死了
+        if (-not $Quiet) { Write-Host ('      找（' + $ri + '/' + $searchRoots.Count + '）：' + $r) -ForegroundColor DarkGray }
         foreach ($h in (Get-ChildItem $r -Recurse -Depth 3 -Filter 'NapCatWinBootMain.exe' -ErrorAction SilentlyContinue)) {
             $candidates += (Split-Path $h.FullName -Parent)
         }
     }
-    Write-Progress -Id 12 -Activity '查找机器上已有的 NapCat' -Completed
     $good = @()
     foreach ($c in @($candidates | Select-Object -Unique)) {
         if (Test-NapCatRoot $c) { $good += $c; continue }
