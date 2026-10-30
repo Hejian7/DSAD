@@ -1855,7 +1855,28 @@ function Find-NapCat {
             if ($r) { return $r }
             Warn '用现成 QQ 这条路没走通，退回一体包（要下 300 MB 左右）'
         } else {
-            Info '没找到已安装的 QQ：用一体包，自带 QQ（约 300 MB）'
+            # 没装 QQ：别默默下 334 MB。先说清楚两条路，让客户自己选。
+            # （会用到这个工具的人，本来就是要"在 QQ 里跟大模型聊天"，几乎必定有 QQ。
+            #   真没有的，装一个 QQ 比下 334 MB 快得多，也不用在机器上多养一套 QQ。）
+            Say ''
+            Warn '这台机器上没有装 QQ'
+            Info 'NapCat 要挂在一个 QQ 客户端上才能跑，它自己不是 QQ。'
+            Info '你自己装个 QQ 再来最省事：只要 34 MB，不用下 334 MB 的一体包。'
+            Say ''
+            if (-not $Quiet) {
+                $ans = Read-Host '   还是要我现在下一体包（自带 QQ，约 334 MB，可能很慢）？(y/N)'
+                if ($ans -notmatch '^[yY]') {
+                    Fail '没有 QQ，装不了 NapCat' @"
+两条路，任选一条：
+
+  · 装个 QQ（推荐）：https://im.qq.com
+    装完重跑本脚本，会自动走 Shell 包，只下 34 MB。
+
+  · 用一体包（自带一整套 QQ）：重跑时加 -NapCatMode onekey
+    要下 334 MB（0.95 + 300 + 34），网络差的时候会很久。
+"@
+                }
+            }
         }
     }
 
