@@ -1,3 +1,8 @@
 *.sh text eol=lf
 *.ps1 text eol=crlf
 *.md text eol=lf
+
+# .cmd 是给 cmd.exe 读的，它对 LF 换行有硬伤：整行会被切错（echo 变成 e + cho）。
+# 所以别让 git 动它的换行——仓库里存 CRLF，GitHub raw 吐出来的也是 CRLF，
+# 客户直接从网页另存一个 卸载.cmd 下来也能双击运行。
+*.cmd -text

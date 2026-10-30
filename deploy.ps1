@@ -485,13 +485,23 @@ function Read-LogTail([string]$Path, [int]$Lines = 1) {
     } catch { return @() }
 }
 
-# 子进程跑到一半的“进度”：计时 + 日志尾巴，每 5 秒一行，避免黑屏干等
-# 返回：真实退出码 / -2 超时 / -1 拿不到退出码（未知，交给调用方按副作用判断）
+# 子进程跑到一半的"进度"。三层一起给，缺一层客户就会以为卡死：
+#   1) 顶部进度条：已用时间 + 已下体积 + 包数 + 当前那行，每秒原地重绘；
+#   2) 每 20 秒往屏幕上滚一行纯文本心跳 —— 有人把窗口最小化过，或者
+#      Write-Progress 在某些终端里根本画不出来，好歹还有条在动的记录；
+#   3) 卡死就换路：StallSec 秒日志一个字没长，直接杀掉让调用方换镜像，
+#      别拿 30 分钟总超时去赌一个已经死掉的连接。
+# 返回：真实退出码 / -2 超时 / -3 卡死 / -1 拿不到退出码（未知，交给调用方按副作用判断）
 function Wait-ProcessWithProgress {
-    param($Process, [string]$Label, [int]$TimeoutSec = 900, [string]$LogPath = '')
+    param($Process, [string]$Label, [int]$TimeoutSec = 900, [string]$LogPath = '', [int]$StallSec = 0, [int]$BeatSec = 20)
+
     $sw = [Diagnostics.Stopwatch]::StartNew()
     $lastShown = ''
     $lastPrint = -10
+    $lastBeat = -$BeatSec
+    $lastMove = 0
+    $lastLine = ''
+
     while (-not $Process.HasExited) {
         if ($script:InterruptRequested) {
             try { $Process.Kill() } catch { }
@@ -500,6 +510,7 @@ function Wait-ProcessWithProgress {
         $elapsed = [int]$sw.Elapsed.TotalSeconds
         if ($elapsed -gt $TimeoutSec) {
             try { $Process.Kill() } catch { }
+            Write-Progress -Id 11 -Activity $Label -Completed
             return -2
         }
         $t = '{0:00}:{1:00}' -f [math]::Floor($elapsed / 60), ($elapsed % 60)
@@ -513,46 +524,93 @@ function Wait-ProcessWithProgress {
             if ($t2.Count -gt 0) { $line = [string]$t2[0] }
             if ($t1.Count -gt 0) { $line = [string]$t1[0] }
         }
-        if ($line.Length -gt 60) { $line = $line.Substring(0, 60) }
+        if ($line.Length -gt 60) { $line = $line.Substring(0, 60) + '…' }
+
+        # uv 的日志能算出真进度：先 "Resolved 154 packages"，之后每个包一行
+        # Downloading / Prepared / Built / Installed。行数是进度，括号里是体积。
+        # 这段只在有日志时算（NapCat 安装器那种没有，就别瞎编数字）。
+        $mb = 0.0
+        $done = 0
+        $totalPkgs = 0
+        if ($LogPath) {
+            $files = @(($LogPath + '.err'), $LogPath)
+            $files = @($files | Where-Object { Test-Path $_ })
+            foreach ($f in $files) {
+                try {
+                    $txt = [System.IO.File]::ReadAllText($f)
+                    $done += ([regex]::Matches($txt, '(?m)^\s*(Downloading|Prepared|Built|Installed)\s')).Count
+                    if ($totalPkgs -eq 0) {
+                        $mm = [regex]::Match($txt, 'Resolved (\d+) packages?')
+                        if ($mm.Success) { $totalPkgs = [int]$mm.Groups[1].Value }
+                    }
+                    foreach ($dm in [regex]::Matches($txt, '(?m)^\s*Downloading\s+\S+\s+\(([\d.]+)\s*(KiB|MiB|GiB)\)')) {
+                        $v = [double]$dm.Groups[1].Value
+                        switch ($dm.Groups[2].Value) {
+                            'KiB' { $mb += $v / 1024 }
+                            'GiB' { $mb += $v * 1024 }
+                            default { $mb += $v }
+                        }
+                    }
+                } catch { }
+            }
+        }
+        if ($line -and $line -ne $lastLine) { $lastLine = $line; $lastMove = $elapsed }
+
+        # 卡死检测：真死掉的连接不会自己好，早点杀掉换源，比干等到总超时强
+        if ($StallSec -gt 0 -and ($elapsed - $lastMove) -ge $StallSec) {
+            try { $Process.Kill() } catch { }
+            Write-Progress -Id 11 -Activity $Label -Completed
+            return -3
+        }
 
         # 原地重绘：不刷屏，也不会把中文画坏
         if (($elapsed - $lastPrint) -ge 1 -or ($line -and $line -ne $lastShown)) {
             $lastPrint = $elapsed
             $lastShown = $line
             if (-not $Quiet) {
-                # uv 会先打印 "Resolved N packages"，之后每个包一行
-                # Downloading/Prepared/Built/Installed —— 两个数凑起来就是真进度
-                $done = 0
-                $totalPkgs = 0
-                if ($LogPath) {
-                    foreach ($f in @(($LogPath + '.err'), $LogPath)) {
-                        if (-not (Test-Path $f)) { continue }
-                        try {
-                            $txt = [System.IO.File]::ReadAllText($f)
-                            $done += ([regex]::Matches($txt, '(?m)^\s*(Downloading|Prepared|Built|Installed)\s')).Count
-                            if ($totalPkgs -eq 0) {
-                                $mm = [regex]::Match($txt, 'Resolved (\d+) packages')
-                                if ($mm.Success) { $totalPkgs = [int]$mm.Groups[1].Value }
-                            }
-                        } catch { }
-                    }
-                }
                 $parts = @('已用 ' + $t)
+                if ($mb -gt 0) { $parts += ('已下 {0:N0} MB' -f $mb) }
                 if ($totalPkgs -gt 0) {
                     $parts += ('{0}/{1} 个包' -f [Math]::Min($done, $totalPkgs), $totalPkgs)
                 } elseif ($done -gt 0) {
                     $parts += ('已处理 ' + $done + ' 个包')
+                } else {
+                    $parts += '正在解析依赖'
                 }
-                if ($line) { $parts += $line }
+                if ($line) {
+                    $short = $line
+                    if ($short.Length -gt 46) { $short = $short.Substring(0, 46) + '…' }
+                    $parts += $short
+                }
                 $status = ($parts -join '  ·  ')
                 if ($status.Length -gt 110) { $status = $status.Substring(0, 110) }
                 $pct = -1
                 if ($totalPkgs -gt 0) {
                     $pct = [int](100 * [Math]::Min($done, $totalPkgs) / $totalPkgs)
                     if ($pct -gt 99) { $pct = 99 }
+                    if ($pct -lt 0) { $pct = 0 }
                 }
                 Write-Progress -Id 11 -Activity $Label -Status $status -PercentComplete $pct
             }
+        }
+
+        # 滚动心跳：客户去泡了杯茶回来，看到的应该是"还在动"，不是一条冻住的条
+        if (-not $Quiet -and $BeatSec -gt 0 -and ($elapsed - $lastBeat) -ge $BeatSec) {
+            $lastBeat = $elapsed
+            Write-Progress -Id 11 -Activity $Label -Completed
+            $beat = '    … ' + $Label + ' 已用 ' + $t
+            if ($mb -gt 0) { $beat += (' ｜ 已下 {0:N0} MB' -f $mb) }
+            if ($totalPkgs -gt 0) {
+                $beat += (' ｜ {0} / {1} 个包' -f [Math]::Min($done, $totalPkgs), $totalPkgs)
+            } elseif ($done -gt 0) {
+                $beat += (' ｜ 已处理 ' + $done + ' 个包')
+            } elseif ($LogPath) {
+                $beat += ' ｜ 正在解析依赖'
+            }
+            if ($line) { $beat += (' ｜ ' + $line) }
+            if (($elapsed - $lastMove) -ge 120) { $beat += ' ｜（两分钟没新动静：多半是网慢，脚本没死）' }
+            Write-Host $beat -ForegroundColor DarkGray
+            Write-Log $beat
         }
         Start-Sleep -Milliseconds 900
     }
@@ -686,6 +744,72 @@ function Fail([string]$Reason, [string]$Hint = '') {
 function Test-IsAdmin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+# ── 安全软件：这部署干的活，在杀软眼里几乎全是坏事 ──────────────────────────
+# 下 exe（uv / Python / QQ）、建 venv、往 QQ 进程里注入、写计划任务。
+# 一句话都不说，客户只会看到"卡在 30%""装完 astrbot.exe 不见了"，然后以为脚本坏了。
+function Get-SecurityProducts {
+    $list = @()
+    $seen = @{}
+
+    # 1) 安全中心登记过的：Defender 和用正规安装包装的国产杀软都在这
+    try {
+        foreach ($a in @(Get-CimInstance -Namespace 'root/SecurityCenter2' -ClassName AntiVirusProduct -ErrorAction Stop)) {
+            $n = [string]$a.displayName
+            if (-not $n -or $seen.ContainsKey($n)) { continue }
+            $seen[$n] = $true
+            # productState 是个位掩码，0x1000 那一位=实时防护开着（各家实现差不多）
+            $psv = 0
+            try { $psv = [int]$a.productState } catch { }
+            if ($psv -eq 0) {
+                $raw = [string]$a.productState
+                if ($raw -match '0x([0-9a-fA-F]+)') { try { $psv = [Convert]::ToInt32($matches[1], 16) } catch { } }
+            }
+            $rt = $true
+            if ($psv -gt 0) { $rt = (($psv -band 0x1000) -ne 0) }
+            $list += [pscustomobject]@{ Name = $n; RealTime = $rt }
+        }
+    } catch { }
+
+    # 2) 没在安全中心登记的（绿色版、老版本、只挂后台的），按进程名兜底
+    $known = @(
+        @{ P = '360tray'; N = '360安全卫士' },
+        @{ P = 'ZhuDongFangYu'; N = '360安全卫士' },
+        @{ P = 'HipsTray'; N = '火绒' },
+        @{ P = 'usysdiag'; N = '火绒' },
+        @{ P = 'QQPCTray'; N = '腾讯电脑管家' },
+        @{ P = 'kxetray'; N = '金山毒霸' },
+        @{ P = 'BaiduSdTray'; N = '百度杀毒' }
+    )
+    foreach ($k in $known) {
+        if ($seen.ContainsKey($k.N)) { continue }
+        if (@(Get-Process -Name $k.P -ErrorAction SilentlyContinue).Count -gt 0) {
+            $seen[$k.N] = $true
+            $list += [pscustomobject]@{ Name = $k.N; RealTime = $true }
+        }
+    }
+    return $list
+}
+
+function Test-DefenderRealTime {
+    try { return [bool](Get-MpComputerStatus -ErrorAction Stop).RealTimeProtectionEnabled }
+    catch { return $false }
+}
+
+# 开场报一次就够了：后面每步都刷一遍，就成了唠叨，客户会直接不看
+function Show-SecurityNotice {
+    $names = @(Get-SecurityProducts | ForEach-Object { $_.Name })
+    $defRt = Test-DefenderRealTime
+    if ($defRt -and -not ($names -contains 'Windows Defender')) { $names = @('Windows Defender') + $names }
+    if ($names.Count -eq 0) { return }
+
+    Say ('    检测到安全软件：' + ($names -join '、')) 'DarkGray'
+    Say '    这套部署要下 exe、建虚拟环境、往 QQ 里注入——杀软常把这些当病毒。' 'Yellow'
+    Say '    半路卡住、装完找不到 astrbot.exe、QQ 一直闪退，都先怀疑它。' 'Yellow'
+    Say '    真遇上了：把这个目录整块加进白名单（或临时关实时防护），再重跑——' 'Yellow'
+    Say ('      ' + $script:Root) 'White'
+    Say '    已经装好的东西不会白装，重跑是接着装。' 'DarkGray'
 }
 
 # ── 基础工具 ───────────────────────────────────────────────────────────────
@@ -999,13 +1123,21 @@ function Install-AstrBotViaUv {
 
     if (-not (Test-Path $venvPy)) {
         Info ('建独立环境：' + $venvDir)
+        Info '  venv 要在一分钟内写出上千个文件，杀软边写边扫会拖慢，个别还会直接把 python.exe 挡住'
         $log = Join-Path $script:LogDir ('venv-{0}.log' -f (Get-Date -Format 'HHmmss'))
         $p = Start-Process -FilePath $uv -PassThru -NoNewWindow `
             -ArgumentList @('venv', ('"' + $venvDir + '"'), '--python', ('"' + $py + '"')) `
             -RedirectStandardOutput $log -RedirectStandardError ($log + '.err')
         $code = Wait-ProcessWithProgress -Process $p -Label '建 venv' -TimeoutSec 300 -LogPath $log
         if ($code -ne 0 -and -not (Test-Path $venvPy)) {
+            $tail = ''
+            $t = @(Read-LogTail -Path ($log + '.err') -Lines 8)
+            if ($t.Count -gt 0) { $tail = ($t -join "`n") }
             Warn ('建 venv 失败（退出码 ' + $code + '）')
+            if ($tail) { Warn $tail }
+            Warn '最常见的原因不是 uv 有问题，是杀软拦了写文件、或者这个目录没权限。'
+            Warn '把下面这个目录加进白名单（或临时关掉实时防护），再重跑本脚本：'
+            Warn ('  ' + $script:AsRoot)
             return $false
         }
     } else {
@@ -1022,17 +1154,21 @@ function Install-AstrBotViaUv {
     $indexes = @(Sort-IndexesBySpeed $indexes)
     foreach ($idx in $indexes) {
         Info ('装 astrbot 到这个环境  ←  ' + $idx)
+        Info '  约 250 MB、150 多个包；进度看上面的条，或每 20 秒滚的那行'
         $log = Join-Path $script:LogDir ('astrbot-pip-{0}.log' -f (Get-Date -Format 'HHmmss'))
         $p = Start-Process -FilePath $uv -PassThru -NoNewWindow `
             -ArgumentList @('pip', 'install', '--python', ('"' + $venvPy + '"'), 'astrbot', '--default-index', $idx) `
             -RedirectStandardOutput $log -RedirectStandardError ($log + '.err')
-        $code = Wait-ProcessWithProgress -Process $p -Label '安装 astrbot' -TimeoutSec 1800 -LogPath $log
+        # StallSec：连着 4 分钟日志一个字都不长，就是这条连接死了（镜像 WAF 限流、
+        # 代理黑洞都长这样），直接杀掉换下一条索引，别干等到 30 分钟总超时
+        $code = Wait-ProcessWithProgress -Process $p -Label '安装 astrbot' -TimeoutSec 1800 -LogPath $log -StallSec 240
 
         $cli = Join-Path $venvDir 'Scripts\astrbot.exe'
         if ($code -eq 0 -and (Test-Path $cli)) {
             Ok ('astrbot 装好了：' + $cli)
             return $true
         }
+        if ($code -eq -3) { Warn ('这个镜像 4 分钟没有新动静，换下一条：' + $idx); continue }
         if ($code -eq -2) { Warn '装 astrbot 超时，换下一条索引'; continue }
         # -1 = PS 拿不到退出码：以“可执行文件在不在”为准
         if ($code -lt 0 -and (Test-Path $cli)) {
@@ -1043,6 +1179,9 @@ function Install-AstrBotViaUv {
         $t = @(Read-LogTail -Path ($log + '.err') -Lines 6)
         if ($t.Count -gt 0) { $tail = ($t -join "`n") }
         Warn ('这个索引装不下来（退出码 ' + $code + '）：' + $tail)
+        if ($tail -match 'Permission denied|Access is denied|being used by another process|拒绝访问') {
+            Warn '看着像被锁了文件：大概率是杀软正在扫/隔离，把上面那个目录加进白名单再重跑'
+        }
     }
     return $false
 }
@@ -1088,6 +1227,13 @@ function Install-AstrBotOfficial {
 
 function Install-AstrBot {
     Step '2.1' '部署 AstrBot'
+
+    Say ''
+    Say '   这一步要下 AstrBot 本体 + 150 多个依赖，约 250 MB。' 'Yellow'
+    Say '   网快 3~5 分钟，网慢 15~20 分钟——慢是正常的，先别怀疑卡死。' 'Yellow'
+    Say '   进度看两处：窗口顶上那行会一直刷，每 20 秒还会滚一行带时间戳的记录。' 'Yellow'
+    Say '   去泡杯茶可以，但别关这个窗口。' 'Yellow'
+    Say ''
 
     Warn '安装期间窗口关闭按钮会失效（防误关）；真要中止，连按两次 Ctrl+C'
     Set-CloseButton $false
@@ -2208,6 +2354,58 @@ function Invoke-OptionalPluginInstaller($AstrBotTarget, [string]$NapCatRoot, [in
     }
 }
 
+# 客户手里最后该剩下两样：能启动的东西、能卸掉的东西。
+# 卸载入口的 .cmd 由安装脚本顺带拉一份；万一没拉成，这里再补一份——
+# 装得进去却卸不掉，是最让人骂街的收场。
+function Ensure-UninstallEntry {
+    $parent = Split-Path $script:AsRoot -Parent
+    if (-not $parent) { return }
+    $target = Join-Path $parent '卸载.cmd'
+
+    $needWrite = $true
+    if (Test-Path $target) {
+        try {
+            $raw = [IO.File]::ReadAllText($target)
+            # 从 GitHub 裸拉下来的是 LF 版，cmd 会把它切错行（能把 echo 切成 e + cho），
+            # 所以只要含裸 LF 就重写一遍
+            $needWrite = [bool]($raw -match "(?<!\r)\n")
+        } catch { $needWrite = $true }
+    }
+    if (-not $needWrite) { return }
+
+    $lines = @(
+        '@echo off',
+        'chcp 65001 >nul',
+        'title DSH-QQ 一键卸载',
+        'setlocal',
+        'cd /d "%~dp0"',
+        '',
+        'rem 想只卸某个组件，给参数：-UninstallTarget 1=AstrBot 2=NapCat 3=插件 4=全删',
+        'set "PS1=%~dp0ds-as-nap\_install\deploy.ps1"',
+        'if exist "%PS1%" goto run',
+        '',
+        'echo.',
+        'echo    找不到部署脚本：%PS1%',
+        'echo    先跑一次安装脚本；或者手动把 deploy.ps1 放到 ds-as-nap\_install\',
+        'echo.',
+        'pause',
+        'exit /b 1',
+        '',
+        ':run',
+        'powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%PS1%" -Uninstall -InstallRoot "%~dp0ds-as-nap" %*',
+        'set RESULT=%ERRORLEVEL%',
+        'echo.',
+        'pause',
+        'exit /b %RESULT%'
+    )
+    try {
+        [IO.File]::WriteAllLines($target, $lines, (New-Object System.Text.UTF8Encoding($false)))
+        Info ('卸载入口已就位：' + $target)
+    } catch {
+        Warn ('卸载入口没写出来（' + $_.Exception.Message + '）；要卸载就跑本脚本加 -Uninstall')
+    }
+}
+
 function Install-Watchdog {
     Step 8 '安装守护任务（每 5 分钟自检一次）'
     $taskName = 'DSH-QQ-Watchdog'
@@ -2226,7 +2424,7 @@ function Get-PathMb([string]$Path) {
 }
 
 # 卸载：可选只删 AstrBot / 只删 NapCat / 只删插件 / 全删。
-# 这个能力并进 deploy.ps1，客户就不用额外拿一个卸载脚本了。
+# 能力就在 deploy.ps1 里；客户那边看到的是安装时顺带拉下来的 卸载.cmd。
 function Invoke-UninstallMenu {
     $target = $UninstallTarget
     if ($target -eq 'ask') {
@@ -2368,6 +2566,8 @@ function Assert-Environment {
     $inv = Get-LocalInventory
     if (-not $SkipNetworkCheck) { Test-NetworkProfile -Inventory $inv }
     else { Warn '按 -SkipNetworkCheck 跳过联网预检：下面哪步下载失败，别怪提示不早说' }
+
+    Show-SecurityNotice
 
     if (-not (Test-IsAdmin)) { Warn '不是管理员：QQ 装在 Program Files 时 NapCat 注入可能失败，登不上就用管理员重跑。' }
 }
@@ -2614,6 +2814,9 @@ try {
         Say '（这一步没有改动任何文件；去掉 -Preflight 才是真部署）' 'DarkGray'
         exit 0
     }
+
+    # 先把"能卸载"这件事钉死，再开始装。装到一半客户想撤，也有个入口。
+    Ensure-UninstallEntry
 
     $ab = Resolve-AstrBot
     Initialize-AstrBotWorkdir $ab
