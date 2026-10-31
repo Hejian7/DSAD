@@ -2622,9 +2622,32 @@ function Start-NapCatBoot([string]$NapCatPath) {
             [Environment]::SetEnvironmentVariable('NAPCAT_QUICK_PASSWORD', $null, 'Process')
         }
 
-        Start-Process -FilePath $boot `
-            -ArgumentList @(('"' + $qqExe + '"'), ('"' + $inject + '"')) `
-            -WorkingDirectory $NapCatPath `
+        # 必须带 -q <机器人号>：NapCat 在非交互环境（输出被重定向）下，
+        # 不给 -q 会先列出"可用于快速登录的账号"，然后发现没人能选，直接退出——
+        # 客户看到的就是"二维码都没出来，窗口就没了"。
+        # 给了 -q：快速登录失败会退回二维码模式，老老实实停在那儿等扫码。
+        $argList = @(('"' + $qqExe + '"'), ('"' + $inject + '"'))
+        $botQQ = ''
+        try {
+            $savedCfg = Get-DeployConfig
+            if ($savedCfg -and $savedCfg.BotQQ) { $botQQ = $savedCfg.BotQQ }
+        } catch { }
+        # 部署流程里问过的话，$QQ 就是它
+        if (-not $botQQ -and $QQ -match '^\d{5,12}$') { $botQQ = $QQ }
+        if (-not $botQQ) {
+            # 配置里没有，就从 NapCat 已有的 onebot 配置文件名里猜（onebot11_<号>.json）
+            try {
+                $f1 = @(Get-ChildItem (Join-Path $NapCatPath 'config') -Filter 'onebot11_*.json' -ErrorAction SilentlyContinue |
+                    Sort-Object LastWriteTime -Descending) | Select-Object -First 1
+                if ($f1 -and $f1.Name -match 'onebot11_(\d+)\.json') { $botQQ = $matches[1] }
+            } catch { }
+        }
+        if ($botQQ) {
+            $argList += @('-q', $botQQ)
+            Info ('带上机器人号：' + $botQQ + '（快速登录失败会自动退回扫码）')
+        }
+
+        Start-Process -FilePath $boot -ArgumentList $argList -WorkingDirectory $NapCatPath `
             -RedirectStandardOutput $consoleLog -RedirectStandardError $consoleErr `
             -WindowStyle Hidden | Out-Null
     } finally {
@@ -3399,6 +3422,26 @@ try {
 
     $ab = Resolve-AstrBot
     Initialize-AstrBotWorkdir $ab
+    # 启动 NapCat 之前先问一句机器人号：NapCat 在非交互环境（输出被重定向）下，
+    # 不给 -q 会列一遍"可登录账号"然后直接退出，客户看到的就是"二维码都没出来"。
+    # 填了能少扫一次码；不填就靠扫码认，但得赌 NapCat 这次肯停下来等。
+    if (-not $QQ -and -not $Quiet) {
+        $cfgQ = Get-DeployConfig
+        if ($cfgQ -and $cfgQ.BotQQ) { $QQ = $cfgQ.BotQQ }
+    }
+    if (-not $QQ -and -not $Quiet) {
+        Say ''
+        Say '  ┌─ 机器人 QQ 号（可选）────────────────────────' 'Cyan'
+        Say '  │  你准备拿来当机器人的那个小号。' 'White'
+        Say '  │  填了能少扫一次码；不填也行，扫完我自动认出来。' 'DarkGray'
+        Say '  └───────────────────────────────────────────────' 'Cyan'
+        $qIn = Read-Host '  机器人 QQ 号（回车 = 不知道，靠扫码识别）'
+        if ($qIn -match '^\d{5,12}$') {
+            $QQ = $qIn
+            Save-DeployConfig -BotQQ $QQ | Out-Null
+        }
+    }
+
     $napRoot = Find-NapCat
     $qqInfo = Get-QqClientInfo
     Assert-VersionMatch $napRoot $qqInfo
