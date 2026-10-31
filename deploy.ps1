@@ -2147,25 +2147,6 @@ function Get-NapCatRunning([string]$NapCatPath) {
 # NapCat 会自己开一个控制台窗口，那个窗口默认拿的是系统代码页（中文机器上是 GBK），
 # 而它打印的是 UTF-8 —— 两边对不上，中文就花屏。
 # 办法：用一个只做两件事的包装脚本启动它（chcp 65001 + 原样执行），把窗口代码页钉死。
-function Get-NapCatLauncher([string]$NapCatPath) {
-    $boot = Join-Path $NapCatPath 'NapCatWinBootMain.exe'
-    if (-not (Test-Path $boot)) { return $boot }
-
-    # 官方 launcher 会把 QQ 路径、注入 DLL、napcat.mjs 拼好再调 bootmain。
-    # 直接跑 35 KB 的 bootmain，它只会打印一行 arg[0] 就退出（客户看到 NapCat 窗口一闪）。
-    foreach ($name in @('launcher-win10.bat', 'launcher.bat', 'napcat.bat')) {
-        $cand = Join-Path $NapCatPath $name
-        if (Test-Path $cand) { return $cand }
-    }
-    $wrapper = Join-Path $NapCatPath 'start-napcat-utf8.cmd'
-    try {
-        $content = "@echo off`r`nchcp 65001 >nul`r`ncd /d `"%~dp0`"`r`n`"%~dp0NapCatWinBootMain.exe`"`r`n"
-        [System.IO.File]::WriteAllText($wrapper, $content, (New-Object System.Text.ASCIIEncoding))
-        return $wrapper
-    } catch {
-        return $boot
-    }
-}
 
 # 让 NapCat 下次启动时自动登录这个号（webui.json 里的 autoLoginAccount）。
 # 目的：扫一次码拿到号之后，重启不必再扫第二次。
@@ -2421,7 +2402,12 @@ function Start-NapCatBoot([string]$NapCatPath) {
     # PS 5.1 的 Start-Process 走 ShellExecute 时，子进程不继承改过的环境变量，
     # bootmain 拿不到 NAPCAT_* 就会空转——进程在、6099 永远不监听、也不报错。
     # 所以生成一个带 set 的 cmd，让 cmd 自己去设、自己去调。
+    #
+    # 窗口藏起来：客户不需要看见那个黑框，误点一下还可能连 QQ 一起关掉。
+    # 但输出不能丢——重定向到 logs\napcat-console.log，真出事时有地方看。
+    # （二维码是 NapCat 自己写 qrcode.png，脚本读文件弹图，跟窗口无关。）
     $wrap = Join-Path $NapCatPath 'start-napcat-dsh.cmd'
+    $consoleLog = Join-Path $script:LogDir 'napcat-console.log'
     $lines = @(
         '@echo off',
         'chcp 65001 >nul',
@@ -2433,11 +2419,11 @@ function Start-NapCatBoot([string]$NapCatPath) {
         'set "NAPCAT_LAUNCHER_PATH=%~dp0NapCatWinBootMain.exe"',
         'set "NAPCAT_MAIN_PATH=%~dp0napcat.mjs"',
         '',
-        ('"%~dp0NapCatWinBootMain.exe" "' + $qqExe + '" "%~dp0NapCatWinBootHook.dll"')
+        ('"%~dp0NapCatWinBootMain.exe" "' + $qqExe + '" "%~dp0NapCatWinBootHook.dll" >> "' + $consoleLog + '" 2>&1')
     )
     [IO.File]::WriteAllLines($wrap, $lines, (New-Object System.Text.UTF8Encoding($false)))
-    Start-Process -FilePath $wrap -WorkingDirectory $NapCatPath | Out-Null
-    Ok ('注入器已启动，目标 QQ：' + $qqExe)
+    Start-Process -FilePath $wrap -WorkingDirectory $NapCatPath -WindowStyle Hidden | Out-Null
+    Ok ('注入器已启动（静默），目标 QQ：' + $qqExe)
 }
 
 function Start-NapCat([string]$NapCatPath, [string]$ExpectQQ, [int]$Port, [switch]$SkipPrompt) {
@@ -3002,8 +2988,21 @@ function Invoke-ActionStart {
     # 拉起来 ≠ 连上了。注入器要先把 QQ 拖起来、自动登录、再建 WS，十几秒起步；
     # 不等这一步就自检，必然报「两边还没连上」，客户以为白装了。
     if ($nap) {
-        if (Wait-NapCatConnected $port 90) { Ok 'NapCat 已连上 AstrBot' }
-        else { Warn 'NapCat 起来了，但 90 秒内没连上 AstrBot：去 6099 面板看它自己的连接状态' }
+        if (Wait-NapCatConnected $port 90) {
+            Ok 'NapCat 已连上 AstrBot'
+        } else {
+            # 没连上，最常见的原因是"要扫码"。NapCat 把二维码写在 cache\qrcode.png，
+            # 直接弹出来给你，省得自己去 6099 面板里翻。
+            $qr = @(Get-ChildItem $nap -Recurse -Filter 'qrcode.png' -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending) | Select-Object -First 1
+            if ($qr) {
+                Info ('需要扫码登录，二维码已经打开：' + $qr.FullName)
+                [void](Open-QrFile $qr.FullName)
+            } else {
+                Info '没找到二维码文件，可能是自动登录还在进行'
+            }
+            Warn 'NapCat 起来了，但 90 秒内没连上 AstrBot：扫一下二维码，或者去 6099 面板看连接状态'
+        }
     }
 
     Invoke-SelfCheck $port $ab | Out-Null
