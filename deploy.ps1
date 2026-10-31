@@ -36,7 +36,7 @@ param(
     [string]$NapCatMode = 'auto',
     [ValidateSet('china', 'official')]
     [string]$DownloadSource = 'china',
-    [ValidateSet('Deploy', 'Check', 'Start', 'Stop', 'Status', 'Backup', 'Logs')]
+    [ValidateSet('Deploy', 'Check', 'Start', 'Stop', 'Status', 'Backup', 'Logs', 'SetCred')]
     [string]$Action = 'Deploy',
     [switch]$SelfCheck,
     [switch]$Probe,
@@ -542,6 +542,33 @@ function Get-FileFromMirrors {
 
 # 读日志尾巴：子进程的输出编码跟控制台走（有 chcp 65001 就是 UTF-8，否则 GBK），
 # 先按 UTF-8 解码，出现替换字符就说明其实是 GBK，换一种再读。
+# 解压 zip。别直接用 Expand-Archive：PS 5.1 那个实现对某些 zip（目录条目和文件条目
+# 混排，NapCat 的包就是）会报 "Cannot find path ... because it does not exist"，
+# 加 -Force 也救不了。结果就是明明 34 MB 能搞定，被迫退回 300 MB 的一体包。
+# 优先用 .NET 的 ZipFile，它稳；真不行再退回 Expand-Archive。
+function Expand-ZipSafe([string]$Zip, [string]$Dest) {
+    if (-not (Test-Path $Dest)) { New-Item -ItemType Directory -Path $Dest -Force | Out-Null }
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($Zip, $Dest)
+        return $true
+    } catch {
+        # 目标目录非空是 ExtractToDirectory 的硬性要求，先清一遍再试一次
+        try {
+            [System.IO.Compression.ZipFile]::ExtractToDirectory($Zip, $Dest, $true)
+            return $true
+        } catch {
+            Warn ('ZipFile 解压失败：' + $_.Exception.Message)
+        }
+    }
+    try {
+        Expand-Archive -Path $Zip -DestinationPath $Dest -Force -ErrorAction Stop
+        return $true
+    } catch {
+        Warn ('Expand-Archive 也失败了：' + $_.Exception.Message)
+        return $false
+    }
+}
 function Read-LogTail([string]$Path, [int]$Lines = 1) {
     if (-not $Path -or -not (Test-Path $Path)) { return @() }
     try {
@@ -1116,10 +1143,7 @@ function Install-Python312 {
 
     if (Test-Path $script:PyDir) { Remove-Item $script:PyDir -Recurse -Force -ErrorAction SilentlyContinue }
     New-Item -ItemType Directory -Path $script:PyDir -Force | Out-Null
-    try {
-        Expand-Archive -Path $zip -DestinationPath $script:PyDir -Force
-    } catch {
-        Warn ('解包失败：' + $_.Exception.Message)
+    if (-not (Expand-ZipSafe $zip $script:PyDir)) {
         return $null
     }
 
@@ -1648,7 +1672,7 @@ function Install-NapCatOneKey {
         Info ('已有安装包，跳过下载：' + $zip)
     }
 
-    Expand-Archive -Path $zip -DestinationPath $base -Force
+    if (-not (Expand-ZipSafe $zip $base)) { Fail '一体包解压失败' ('包可能下坏了，删掉重下：' + $zip) }
     $installer = Join-Path $base 'NapCatInstaller.exe'
     if (-not (Test-Path $installer)) { Fail '一体包里没有 NapCatInstaller.exe' ('解压目录：' + $base + '；包可能下坏了，删掉重下。') }
 
@@ -1725,10 +1749,7 @@ function Install-NapCatShell {
 
     if (Test-Path $base) { Remove-Item $base -Recurse -Force -ErrorAction SilentlyContinue }
     New-Item -ItemType Directory -Path $base -Force | Out-Null
-    try {
-        Expand-Archive -Path $zip -DestinationPath $base -Force
-    } catch {
-        Warn ('解压失败：' + $_.Exception.Message)
+    if (-not (Expand-ZipSafe $zip $base)) {
         return $null
     }
 
@@ -2421,6 +2442,49 @@ function Remove-NapCatCred {
     Remove-Item $p -Force -ErrorAction SilentlyContinue
 }
 
+function Show-CredToggle {
+    Step '记住密码' '开启 / 关闭免扫码登录'
+    $cred = Get-NapCatCred
+    if ($cred) { Ok ('当前：已开启（记住的号：' + $cred.QQ + '）') }
+    else { Info '当前：已关闭（每次重启要扫码）' }
+
+    Say ''
+    Say '   1 = 开启（记住 QQ 密码，以后重启免扫码）' 'White'
+    Say '   0 = 关闭（删掉密码，改回扫码登录）' 'White'
+    Say ''
+    Say '   密码用 Windows 自带的加密存，只有这台机器、这个用户能解开。' 'DarkGray'
+    Say '   但启动那一瞬间，它会以明文出现在 NapCat 的进程环境里。' 'DarkGray'
+    Say ''
+    $c = Read-Host '   输入 1 或 0'
+
+    switch ($c.Trim()) {
+        '1' {
+            $qqNum = Read-Host '   机器人 QQ 号'
+            if ($qqNum -notmatch '^\d{5,12}$') { Fail 'QQ 号格式不对' '纯数字，5~12 位，比如 2093698989。' }
+            $sec = Read-Host '   QQ 密码（输入时不显示）' -AsSecureString
+            $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
+            try { $plain = [Runtime.InteropServices.Marshal]::PtrToStringAuto($ptr) }
+            finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
+            if (-not $plain) { Fail '密码是空的' '什么都没改。' }
+            if (Save-NapCatCred $qqNum $plain) {
+                Say ''
+                Ok '记住了。下次「启动.cmd」会拿它直接登录'
+                Info '想立刻生效：先「停止.cmd」再「启动.cmd」'
+            } else {
+                Fail '存不下来' '可能没有写权限，或者 DPAPI 出了问题。'
+            }
+        }
+        '0' {
+            Remove-NapCatCred
+            Say ''
+            Ok '已关闭。下次启动会要求扫码登录'
+        }
+        default {
+            Say ''
+            Warn '没听懂，什么也没改。'
+        }
+    }
+}
 function Start-NapCatBoot([string]$NapCatPath) {
     $boot = Join-Path $NapCatPath 'NapCatWinBootMain.exe'
     $inject = Join-Path $NapCatPath 'NapCatWinBootHook.dll'
@@ -3202,6 +3266,7 @@ try {
         'Stop'   { Invoke-ActionStop }
         'Backup' { Invoke-ActionBackup }
         'Logs'   { Invoke-ActionLogs }
+        'SetCred' { Show-CredToggle; exit 0 }
         'Status' {
             $sp = $OneBotPort
             $sab = Resolve-AstrBotExisting
@@ -3269,11 +3334,56 @@ try {
 
     # 该问的是"主人号"：当管理员、收测试消息都要它
     if (-not $OwnerQQ -and -not $Quiet) {
-        $OwnerQQ = Read-Host '你自己的 QQ 号（当管理员、接收测试消息；可回车跳过）'
+        Say ''
+        Say '  ┌─ 你的 QQ 号（主人号）────────────────────────' 'Cyan'
+        Say '  │  填【你自己】平时用的那个 QQ，不是给机器人的小号。' 'White'
+        Say '  │  机器人会把你设成管理员，装完还会主动给你发一条测试消息。' 'DarkGray'
+        Say '  │  跳过也能装，但装完你得自己去 6185 面板里把管理员补上。' 'Yellow'
+        Say '  └───────────────────────────────────────────────' 'Cyan'
+        $OwnerQQ = Read-Host '  你的 QQ 号（纯数字，直接回车 = 先跳过）'
     }
     if ($OwnerQQ -and $OwnerQQ -notmatch '^\d{5,12}$') { Warn ('主人号格式看着不对：' + $OwnerQQ + '，先不管了') ; $OwnerQQ = '' }
 
-    if (-not $ApiKey) { $ApiKey = Read-Host '请输入模型 API Key（回车跳过，之后在 WebUI 里填）' }
+    if (-not $ApiKey -and -not $Quiet) {
+        Say ''
+        Say '  ┌─ 模型 API Key ────────────────────────────────' 'Cyan'
+        Say '  │  机器人要用大模型才能回话，API Key 就是那把钥匙。' 'White'
+        Say '  │  没有它也能装完，但机器人不会说话——得你自己去面板里补。' 'Yellow'
+        Say '  └───────────────────────────────────────────────' 'Cyan'
+        Say ''
+
+        $knowsKey = Read-Host '  你知道自己的 API Key 吗？（1 = 知道，0 = 不知道，帮我打开申请页面）'
+        if ($knowsKey -eq '1') {
+            Say ''
+            Say '  把 API Key 贴进来（右键就是粘贴）。' 'White'
+            Say '  脚本会自动写进配置，装完机器人就能说话。' 'DarkGray'
+            $ApiKey = Read-Host '  API Key（直接回车 = 装完自己去 6185 面板填）'
+        } else {
+            Say ''
+            Say '  那我们先去申请一把，很快：' 'White'
+            Say '    1. 下面打开的页面里登录或注册（手机号/微信都行）' 'DarkGray'
+            Say '    2. 左侧点「API keys」→「创建 API key」' 'DarkGray'
+            Say '    3. 名字随便填（比如 dsh），点「创建」' 'DarkGray'
+            Say '    4. 点「复制」，把那串 sk- 开头的复制下来' 'DarkGray'
+            Say '    5. 回到这个窗口，右键粘贴（或者按 Shift+Insert）' 'DarkGray'
+            Say ''
+            Say '  正在打开：https://platform.deepseek.com/api_keys' 'Cyan'
+            try { Start-Process 'https://platform.deepseek.com/api_keys' } catch { Warn '浏览器没打开的话，手动复制上面这个地址去访问' }
+            Say ''
+            Say '  拿到以后粘在这里；不想现在弄就回车跳过，装完去 6185 面板里填。' 'DarkGray'
+            $pasted = Read-Host '  API Key'
+            if ($pasted -and $pasted.Trim().Length -ge 10) { $ApiKey = $pasted.Trim() }
+        }
+
+        if ($ApiKey) {
+            $head = $ApiKey.Substring(0, [Math]::Min(7, $ApiKey.Length))
+            Ok ('API Key 收到（' + $head + '...）')
+        } else {
+            Warn '没填 API Key：装完机器人不会回话，记得去 6185 面板补上'
+        }
+    } elseif (-not $ApiKey -and $Quiet) {
+        Info '静默模式：没给 -ApiKey，装完自己去面板补'
+    }
 
     if (-not (Test-Path $ab.Config)) {
         Info '还没配置：先启动一次 AstrBot 让它生成默认配置'
