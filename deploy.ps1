@@ -3503,6 +3503,8 @@ try {
     if ($OwnerQQ -and $OwnerQQ -notmatch '^\d{5,12}$') { Warn ('主人号格式看着不对：' + $OwnerQQ + '，先不管了') ; $OwnerQQ = '' }
     if ($OwnerQQ) { Save-DeployConfig -OwnerQQ $OwnerQQ | Out-Null }
 
+    # 参数直接给的也算数，存下来——不然每次都得重新传
+    if ($ApiKey) { Save-DeployConfig -ApiKey $ApiKey | Out-Null }
     if (-not $ApiKey -and -not $Quiet) {
         Say ''
         Say '  ┌─ 模型 API Key ────────────────────────────────' 'Cyan'
