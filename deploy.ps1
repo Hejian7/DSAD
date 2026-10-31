@@ -2175,6 +2175,63 @@ function Save-PanelCredentials([string]$Path, [string]$Password, [string]$NapCat
     } catch { }
 }
 
+# 把模板里的人格写进客户的 AstrBot 数据库。
+#
+# 为什么不能只塞 cmd_config.json：AstrBot 4.x 的人格存在 data_v4.db 的 personas 表里，
+# cmd_config.json 里那个 persona 字段是空的（我一开始就查错了地方）。
+# 所以这里直接操作 SQLite —— 用 AstrBot 自己的 venv python，不额外装东西。
+function Import-PersonaTemplate {
+    $tpl = Join-Path $PSScriptRoot 'templates\personas.json'
+    if (-not (Test-Path $tpl)) { return $false }
+
+    $db = Join-Path $script:Root 'astrbot\data\data_v4.db'
+    if (-not (Test-Path $db)) { return $false }
+
+    $py = Join-Path $script:Root 'astrbot\.venv\Scripts\python.exe'
+    if (-not (Test-Path $py)) { return $false }
+
+    $script = Join-Path $env:TEMP ('import-persona-' + [guid]::NewGuid().ToString('N').Substring(0,8) + '.py')
+    $code = @'
+import sqlite3, json, sys
+db, tpl = sys.argv[1], sys.argv[2]
+rows = json.load(open(tpl, encoding="utf-8"))
+if not rows:
+    sys.exit(0)
+c = sqlite3.connect(db)
+c.row_factory = sqlite3.Row
+exists = set(r[0] for r in c.execute("select persona_id from personas"))
+cols = [r[1] for r in c.execute("PRAGMA table_info(personas)")]
+for r in rows:
+    use = {k: v for k, v in r.items() if k in cols and k != "id"}
+    pid = use.get("persona_id", "default")
+    if pid in exists:
+        sets = ",".join([k + "=?" for k in use.keys() if k != "persona_id"])
+        vals = [use[k] for k in use.keys() if k != "persona_id"]
+        c.execute("update personas set " + sets + " where persona_id=?", vals + [pid])
+    else:
+        cs = ",".join(use.keys())
+        ph = ",".join(["?"] * len(use))
+        c.execute("insert into personas (" + cs + ") values (" + ph + ")", list(use.values()))
+c.commit()
+print("personas imported: " + str(len(rows)))
+'@
+    try {
+        [IO.File]::WriteAllText($script, $code, (New-Object System.Text.UTF8Encoding($false)))
+        $out = & $py $script $db $tpl 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Info ('人格模板已写入：' + ($out -join ' '))
+            return $true
+        }
+        Warn ('人格模板写入失败：' + ($out -join ' '))
+        return $false
+    } catch {
+        Warn ('人格模板写入出错：' + $_.Exception.Message)
+    } finally {
+        Remove-Item $script -Force -ErrorAction SilentlyContinue
+    }
+    return $false
+}
+
 function Get-NapCatRunning([string]$NapCatPath) {
     return @(Get-CimInstance Win32_Process -Filter "Name='NapCatWinBootMain.exe'" -ErrorAction SilentlyContinue |
         Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($NapCatPath, [StringComparison]::OrdinalIgnoreCase) })
@@ -3589,6 +3646,9 @@ try {
             Save-PanelCredentials (Join-Path $script:Root '面板密码.txt') $ob.PanelPassword '' ''
         } catch { }
     }
+
+    # 人格不在 cmd_config.json 里，在 data_v4.db 的 personas 表里，单独灌进去
+    if (-not (Import-PersonaTemplate)) { Info '没有人格模板（基础版就是这样，原版人格）' }
 
     # 插件是选装：包里带 install-plugin.ps1 就装，没带就是基础版
     Invoke-OptionalPluginInstaller $ab $napRoot $ob.Port $OwnerQQ | Out-Null
