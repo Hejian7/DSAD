@@ -2175,6 +2175,117 @@ function Save-PanelCredentials([string]$Path, [string]$Password, [string]$NapCat
     } catch { }
 }
 
+# 解压升级版的状态包，把作者调好的东西铺到客户机器上。
+#
+# 包是单个 zip（templates\astrbot-state.zip），里面：
+#   cmd_config.json   模型/参数（脱敏过）
+#   personas.json     人格
+#   plugins/          插件源码
+#   config/           插件配置
+#
+# 基础版没有这个 zip，函数直接返回 false —— 跟 plugin、personas 那套一样，
+# 包里有就有，没有就走原版。
+function Import-AstrBotState {
+    $zip = Join-Path $PSScriptRoot 'templates\astrbot-state.zip'
+    if (-not (Test-Path $zip)) { return $false }
+
+    $data = Join-Path $script:Root 'astrbot\data'
+    if (-not (Test-Path $data)) { return $false }
+
+    $stage = Join-Path $env:TEMP ('dsh-state-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    try {
+        Info ('发现状态包：' + ([math]::Round((Get-Item $zip).Length / 1KB, 1)) + ' KB，开始铺')
+        if (-not (Expand-ZipSafe $zip $stage)) { return $false }
+
+        $manifest = $null
+        $mf = Join-Path $stage 'manifest.json'
+        if (Test-Path $mf) { try { $manifest = Get-Content $mf -Raw -Encoding UTF8 | ConvertFrom-Json } catch { } }
+        if ($manifest) {
+            Info ('包里的东西：' + $manifest.PluginCount + ' 个插件，' + $manifest.ConfigCount + ' 个配置文件，导出于 ' + $manifest.ExportedAt)
+        }
+
+        # 1) 插件源码
+        $sp = Join-Path $stage 'plugins'
+        if (Test-Path $sp) {
+            $dp = Join-Path $data 'plugins'
+            if (-not (Test-Path $dp)) { New-Item -ItemType Directory -Path $dp -Force | Out-Null }
+            $n = 0
+            Get-ChildItem $sp -Directory | ForEach-Object {
+                $dst = Join-Path $dp $_.Name
+                robocopy $_.FullName $dst /E /NFL /NDL /NJH /NJS /NP | Out-Null
+                $n++
+            }
+            Ok ('插件已铺好：' + $n + ' 个（AstrBot 启动时会自己扫出来）')
+        }
+
+        # 2) 插件配置
+        $sc = Join-Path $stage 'config'
+        if (Test-Path $sc) {
+            $dc = Join-Path $data 'config'
+            if (-not (Test-Path $dc)) { New-Item -ItemType Directory -Path $dc -Force | Out-Null }
+            robocopy $sc $dc /E /NFL /NDL /NJH /NJS /NP | Out-Null
+            $c = @(Get-ChildItem $dc -Recurse -File -ErrorAction SilentlyContinue).Count
+            Ok ('插件配置已铺好：' + $c + ' 个文件')
+        }
+
+        # 3) 模型配置：只在客户还没有配置时铺（有就保留客户自己的）
+        $scfg = Join-Path $stage 'cmd_config.json'
+        $dcfg = Join-Path $data 'cmd_config.json'
+        if ((Test-Path $scfg) -and -not (Test-Path $dcfg)) {
+            Copy-Item $scfg $dcfg -Force
+            Ok '模型配置已初始化（api_key 是空的，装完要客户自己填）'
+        }
+
+        # 4) 人格
+        $spersona = Join-Path $stage 'personas.json'
+        if ((Test-Path $spersona) -and (Test-Path $dcfg)) {
+            $py = Join-Path $script:Root 'astrbot\.venv\Scripts\python.exe'
+            $db = Join-Path $data 'data_v4.db'
+            if ((Test-Path $py) -and (Test-Path $db)) {
+                $pyScript = Join-Path $env:TEMP ('dsh-imp-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.py')
+                $code = @'
+import sqlite3, json, sys
+db, tpl = sys.argv[1], sys.argv[2]
+rows = json.load(open(tpl, encoding="utf-8"))
+c = sqlite3.connect(db)
+c.row_factory = sqlite3.Row
+exists = set(r[0] for r in c.execute("select persona_id from personas"))
+cols = [r[1] for r in c.execute("PRAGMA table_info(personas)")]
+for r in rows:
+    use = {k: v for k, v in r.items() if k in cols and k != "id"}
+    pid = use.get("persona_id", "default")
+    if pid in exists:
+        sets = ",".join([k + "=?" for k in use.keys() if k != "persona_id"])
+        vals = [use[k] for k in use.keys() if k != "persona_id"]
+        c.execute("update personas set " + sets + " where persona_id=?", vals + [pid])
+    else:
+        cs = ",".join(use.keys()); ph = ",".join(["?"] * len(use))
+        c.execute("insert into personas (" + cs + ") values (" + ph + ")", list(use.values()))
+c.commit()
+print("ok " + str(len(rows)))
+'@
+                try {
+                    [IO.File]::WriteAllText($pyScript, $code, (New-Object System.Text.UTF8Encoding($false)))
+                    $out = & $py $pyScript $db $spersona 2>&1
+                    if ($LASTEXITCODE -eq 0) { Ok '人格已写入' } else { Warn ('人格写入失败：' + ($out -join ' ')) }
+                } catch {
+                    Warn ('人格写入出错：' + $_.Exception.Message)
+                } finally {
+                    Remove-Item $pyScript -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
+
+        return $true
+    } catch {
+        Warn ('状态包处理失败：' + $_.Exception.Message)
+        return $false
+    } finally {
+        Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+
 # 把模板里的人格写进客户的 AstrBot 数据库。
 #
 # 为什么不能只塞 cmd_config.json：AstrBot 4.x 的人格存在 data_v4.db 的 personas 表里，
@@ -3636,6 +3747,12 @@ try {
     # 管理员给「主人号」：AstrBot 的管理指令应该由你来使，不是机器人自己
     $adminQQ = $OwnerQQ
     if (-not $adminQQ) { $adminQQ = $QQ }
+    # 升级版的状态包（模型 + 人格 + 插件 + 插件配置）先铺好，
+    # 之后 Set-AstrBotConfig 再往上面盖客户自己的号、Key、平台。
+    # 基础版没有这个 zip，这里直接 false，什么都不做。
+    $stateImported = Import-AstrBotState
+    if (-not $stateImported) { Info '没有状态包（基础版，或者还没导出过），按原版配置走' }
+
     $ob = Set-AstrBotConfig $ab $adminQQ $ApiKey -GroupMode:$Group -Wake $WakeWord -Gid $GroupId
 
     # 立刻把密码落盘。配置里的哈希在这一刻已经换成新密码了，密码文件要是不跟着更新，
