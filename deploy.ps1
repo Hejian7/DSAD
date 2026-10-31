@@ -2383,6 +2383,44 @@ function Wait-NapCatConnected([int]$Port, [int]$TimeoutSec = 120) {
 # 会静默退出，bootmain 压根没被调用 —— 客户看到的就是"NapCat 一闪没影"，
 # 可手动带参数跑 bootmain 一切正常。它真正需要的只有两个路径 + 五个环境变量，
 # 那就自己设、自己调，少一层猜谜。
+# ── 记住密码（免扫码登录）─────────────────────────────────────────────────
+# NapCat 支持用环境变量直接登录：NAPCAT_ACCOUNT + NAPCAT_QUICK_PASSWORD，
+# 不用扫码、也不会因为"登录态失效"掉线。
+# 代价是 QQ 密码得留在客户机器上。所以：
+#   · 用 Windows DPAPI 加密存（ConvertFrom-SecureString），绑定当前用户——
+#     换台机器、换个用户拷过去都是一堆乱码；
+#   · 启动瞬间仍要以明文写进 start-napcat-dsh.cmd（NapCat 只认环境变量），
+#     这个窗口期很短，但确实存在。交互里会跟客户讲明白。
+function Save-NapCatCred([string]$QQ, [string]$Password) {
+    if (-not $QQ -or -not $Password) { return $false }
+    try {
+        $sec = ConvertTo-SecureString $Password -AsPlainText -Force
+        $enc = ConvertFrom-SecureString $sec
+        $p = Join-Path $script:Root 'napcat-cred.txt'
+        [IO.File]::WriteAllText($p, ($QQ + "`r`n" + $enc), (New-Object System.Text.UTF8Encoding($false)))
+        return $true
+    } catch { return $false }
+}
+
+function Get-NapCatCred {
+    $p = Join-Path $script:Root 'napcat-cred.txt'
+    if (-not (Test-Path $p)) { return $null }
+    try {
+        $lines = [IO.File]::ReadAllLines($p, [Text.Encoding]::UTF8)
+        if ($lines.Length -lt 2 -or -not $lines[0] -or -not $lines[1]) { return $null }
+        $sec = $lines[1] | ConvertTo-SecureString
+        $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
+        try { $pw = [Runtime.InteropServices.Marshal]::PtrToStringAuto($ptr) }
+        finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
+        return [pscustomobject]@{ QQ = $lines[0].Trim(); Password = $pw }
+    } catch { return $null }
+}
+
+function Remove-NapCatCred {
+    $p = Join-Path $script:Root 'napcat-cred.txt'
+    Remove-Item $p -Force -ErrorAction SilentlyContinue
+}
+
 function Start-NapCatBoot([string]$NapCatPath) {
     $boot = Join-Path $NapCatPath 'NapCatWinBootMain.exe'
     $inject = Join-Path $NapCatPath 'NapCatWinBootHook.dll'
@@ -2398,31 +2436,52 @@ function Start-NapCatBoot([string]$NapCatPath) {
         if (-not (Test-Path $qqExe)) { Fail ('QQ 目录里没有 QQ.exe：' + $qq.Root) '装一个完整版的 QQ NT。' }
     }
 
-    # 关键：不能只给本进程设环境变量再 Start-Process 就完事。
-    # PS 5.1 的 Start-Process 走 ShellExecute 时，子进程不继承改过的环境变量，
-    # bootmain 拿不到 NAPCAT_* 就会空转——进程在、6099 永远不监听、也不报错。
-    # 所以生成一个带 set 的 cmd，让 cmd 自己去设、自己去调。
-    #
-    # 窗口藏起来：客户不需要看见那个黑框，误点一下还可能连 QQ 一起关掉。
-    # 但输出不能丢——重定向到 logs\napcat-console.log，真出事时有地方看。
-    # （二维码是 NapCat 自己写 qrcode.png，脚本读文件弹图，跟窗口无关。）
-    $wrap = Join-Path $NapCatPath 'start-napcat-dsh.cmd'
+    # 为什么不用 cmd 包装：
+    #   批处理里 set "VAR=value" 遇到 & | < > % 会被拆行，转义怎么写都不保险
+    #   （set "P=a^&b" 实测照样把一行拆成两条命令）。密码里这些符号太常见了。
+    # 为什么不用不带重定向的 Start-Process：
+    #   PS 5.1 走 ShellExecute 时，子进程不继承本进程改过的环境变量，
+    #   bootmain 拿不到 NAPCAT_* 就空转——进程在、6099 永远不监听、也不报错。
+    # 所以：给本进程设环境变量，再用带重定向的 Start-Process（这条路是 CreateProcess，
+    # 环境变量能继承），密码全程不落盘。
+    $envNames = @('NAPCAT_PATCH_PACKAGE', 'NAPCAT_LOAD_PATH', 'NAPCAT_INJECT_PATH', 'NAPCAT_LAUNCHER_PATH', 'NAPCAT_MAIN_PATH', 'NAPCAT_ACCOUNT', 'NAPCAT_QUICK_PASSWORD')
+    $saved = @{}
+    foreach ($n in $envNames) { $saved[$n] = [Environment]::GetEnvironmentVariable($n, 'Process') }
+
     $consoleLog = Join-Path $script:LogDir 'napcat-console.log'
-    $lines = @(
-        '@echo off',
-        'chcp 65001 >nul',
-        'cd /d "%~dp0"',
-        '',
-        'set "NAPCAT_PATCH_PACKAGE=%~dp0qqnt.json"',
-        'set "NAPCAT_LOAD_PATH=%~dp0loadNapCat.js"',
-        'set "NAPCAT_INJECT_PATH=%~dp0NapCatWinBootHook.dll"',
-        'set "NAPCAT_LAUNCHER_PATH=%~dp0NapCatWinBootMain.exe"',
-        'set "NAPCAT_MAIN_PATH=%~dp0napcat.mjs"',
-        '',
-        ('"%~dp0NapCatWinBootMain.exe" "' + $qqExe + '" "%~dp0NapCatWinBootHook.dll" >> "' + $consoleLog + '" 2>&1')
-    )
-    [IO.File]::WriteAllLines($wrap, $lines, (New-Object System.Text.UTF8Encoding($false)))
-    Start-Process -FilePath $wrap -WorkingDirectory $NapCatPath -WindowStyle Hidden | Out-Null
+    $consoleErr = Join-Path $script:LogDir 'napcat-console.err'
+
+    try {
+        [Environment]::SetEnvironmentVariable('NAPCAT_PATCH_PACKAGE', (Join-Path $NapCatPath 'qqnt.json'), 'Process')
+        [Environment]::SetEnvironmentVariable('NAPCAT_LOAD_PATH', (Join-Path $NapCatPath 'loadNapCat.js'), 'Process')
+        [Environment]::SetEnvironmentVariable('NAPCAT_INJECT_PATH', $inject, 'Process')
+        [Environment]::SetEnvironmentVariable('NAPCAT_LAUNCHER_PATH', $boot, 'Process')
+        [Environment]::SetEnvironmentVariable('NAPCAT_MAIN_PATH', (Join-Path $NapCatPath 'napcat.mjs'), 'Process')
+
+        # 有存过的密码就走免扫码登录，没有就扫码
+        $cred = Get-NapCatCred
+        if ($cred) {
+            [Environment]::SetEnvironmentVariable('NAPCAT_ACCOUNT', $cred.QQ, 'Process')
+            [Environment]::SetEnvironmentVariable('NAPCAT_QUICK_PASSWORD', $cred.Password, 'Process')
+            Info ('用记住的密码直接登录：' + $cred.QQ + '（失败会自动退回扫码）')
+        } else {
+            [Environment]::SetEnvironmentVariable('NAPCAT_ACCOUNT', $null, 'Process')
+            [Environment]::SetEnvironmentVariable('NAPCAT_QUICK_PASSWORD', $null, 'Process')
+        }
+
+        Start-Process -FilePath $boot `
+            -ArgumentList @(('"' + $qqExe + '"'), ('"' + $inject + '"')) `
+            -WorkingDirectory $NapCatPath `
+            -RedirectStandardOutput $consoleLog -RedirectStandardError $consoleErr `
+            -WindowStyle Hidden | Out-Null
+    } finally {
+        foreach ($n in $envNames) { [Environment]::SetEnvironmentVariable($n, $saved[$n], 'Process') }
+    }
+
+    # 老版本留下的包装脚本，别再让它被误用
+    $oldWrap = Join-Path $NapCatPath 'start-napcat-dsh.cmd'
+    if (Test-Path $oldWrap) { Remove-Item $oldWrap -Force -ErrorAction SilentlyContinue }
+
     Ok ('注入器已启动（静默），目标 QQ：' + $qqExe)
 }
 
@@ -3322,6 +3381,30 @@ try {
 
     # 自检消息：让机器人主动给主人发一条，客户立刻能看到“活的”
     Invoke-TestMessage $ob.Token $QQ
+
+    # 收尾一问：要不要记住密码，以后重启免扫码。
+    # 只问一次——已经存过就不再啰嗦（想改密码就删 ds-as-nap\napcat-cred.txt 重跑）。
+    if (-not $Quiet -and $QQ -and -not (Get-NapCatCred)) {
+        Say ''
+        Say '   每次重启都要拿手机扫码，挺烦的。可以把这个号的密码记住，让 NapCat 直接登录。' 'White'
+        Say '   · 密码用 Windows 自带的加密存，只有这台机器、这个用户能解开' 'DarkGray'
+        Say '   · 但启动那一瞬间，它会以明文出现在一个临时脚本里' 'DarkGray'
+        Say '   · 不记也行：每次重启扫一下码就是了' 'DarkGray'
+        $ans = Read-Host '   要记住吗？(y/N)'
+        if ($ans -match '^[yY]') {
+            $sec = Read-Host '   输入这个机器人号的 QQ 密码（输入时不显示）' -AsSecureString
+            $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
+            try { $plain = [Runtime.InteropServices.Marshal]::PtrToStringAuto($ptr) }
+            finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
+            if ($plain -and (Save-NapCatCred $QQ $plain)) {
+                Ok '记住了，下次重启不用扫码'
+            } else {
+                Warn '没存成功，下次还是扫码登录'
+            }
+        } else {
+            Info '没记住。想改主意的话，重跑一次部署脚本会再问一遍'
+        }
+    }
 
     # 配置完成 → 报密码 → 打开两个面板
     $webNap = Get-NapCatWebUi $napRoot
