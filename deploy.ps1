@@ -68,7 +68,7 @@ $script:EntryKeyExpected = 'DSH-QQ-7f3a9c2e'
 
 # 注意：这里只能用 Write-Host，不能用 Say —— Say 要等到函数定义那一段才注册，
 # 这段跑在它前头。
-if ($Action -eq 'Deploy' -and -not $Preflight -and -not $Probe -and -not $SelfCheck -and -not $Uninstall -and $EntryKey -ne $script:EntryKeyExpected) {
+if ($Action -eq 'Deploy' -and -not $Preflight -and -not $Probe -and -not $SelfCheck -and -not $Uninstall -and $env:DSAD_NO_GATE -ne '1' -and $EntryKey -ne $script:EntryKeyExpected) {
     Write-Host ''
     Write-Host '  ──────────────────────────────────────────────' -ForegroundColor Yellow
     Write-Host '  这个脚本要通过安装入口启动。' -ForegroundColor Yellow
@@ -2270,7 +2270,7 @@ function Show-QrCode([string]$Path, [string]$ExpectQQ) {
     Say ''
     Say '   第 1 步：打开手机 QQ → 右上角「+」→ 扫一扫'
     Say '   第 2 步：用你准备当机器人的【小号】扫，别用平时自己聊天的号'
-    Say '   第 3 步：扫完就放那儿，我会自动检测、关掉二维码、继续往下配'
+    Say '   第 3 步：手机上会弹「确认登录」，点一下才算完 —— 只扫码不确认，它就一直等'
     Say ''
     Say ('   二维码文件：' + $Path) 'DarkGray'
     if (Open-QrFile $Path) {
@@ -2381,7 +2381,7 @@ function Wait-NapCatLogin([string]$NapCatPath, [string]$ExpectQQ, [int]$Port) {
 
         if (($elapsed - $lastBeat) -ge 30) {
             $lastBeat = $elapsed
-            if ($lastKey) { Info ('还在等你扫码…… 已等 ' + $elapsed + ' 秒 / 最多 360 秒') }
+            if ($lastKey) { Info ('还在等你扫码…… 已等 ' + $elapsed + ' 秒 / 最多 360 秒（扫完还要在手机上点「确认登录」）') }
             else { Info ('NapCat 正在准备登录界面…… 已等 ' + $elapsed + ' 秒') }
         }
         Start-Sleep -Milliseconds 900
@@ -2420,6 +2420,79 @@ function Wait-NapCatConnected([int]$Port, [int]$TimeoutSec = 120) {
 #     换台机器、换个用户拷过去都是一堆乱码；
 #   · 启动瞬间仍要以明文写进 start-napcat-dsh.cmd（NapCat 只认环境变量），
 #     这个窗口期很短，但确实存在。交互里会跟客户讲明白。
+# ── 部署填过的信息，攒着下次用 ─────────────────────────────────────────────
+# 客户重装一次就要重新敲一遍 QQ 号、API Key，谁都会烦。
+# 这里把填过的存到 ds-as-nap\deploy-config.json，下次部署开场先问要不要复用。
+# API Key 和 QQ 密码都是敏感东西，用 Windows DPAPI 加密（绑定当前用户，
+# 拷到别的机器上就是乱码）。主人号、机器人号不加密——它们本来就是公开信息。
+function Protect-Text([string]$Text) {
+    if (-not $Text) { return '' }
+    try {
+        return (ConvertFrom-SecureString (ConvertTo-SecureString $Text -AsPlainText -Force))
+    } catch { return '' }
+}
+
+function Unprotect-Text([string]$Cipher) {
+    if (-not $Cipher) { return '' }
+    try {
+        $sec = $Cipher | ConvertTo-SecureString
+        $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
+        try { return [Runtime.InteropServices.Marshal]::PtrToStringAuto($ptr) }
+        finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
+    } catch { return '' }
+}
+
+function Get-DeployConfig {
+    $p = Join-Path $script:Root 'deploy-config.json'
+    if (-not (Test-Path $p)) { return $null }
+    try {
+        $o = Get-Content $p -Raw -Encoding UTF8 | ConvertFrom-Json
+        return [pscustomobject]@{
+            OwnerQQ    = [string]$o.OwnerQQ
+            BotQQ      = [string]$o.BotQQ
+            ApiKey     = (Unprotect-Text ([string]$o.ApiKeyEnc))
+            QqPassword = (Unprotect-Text ([string]$o.QqPasswordEnc))
+            SavedAt    = [string]$o.SavedAt
+        }
+    } catch { return $null }
+}
+
+# 只传要改的字段，其余沿用文件里的旧值
+function Save-DeployConfig {
+    param(
+        [string]$OwnerQQ = '',
+        [string]$BotQQ = '',
+        [string]$ApiKey = '',
+        [string]$QqPassword = ''
+    )
+    try {
+        $p = Join-Path $script:Root 'deploy-config.json'
+        $oldOwner = ''; $oldBot = ''; $oldKeyEnc = ''; $oldPwEnc = ''
+        if (Test-Path $p) {
+            try {
+                $cur = Get-Content $p -Raw -Encoding UTF8 | ConvertFrom-Json
+                $oldOwner = [string]$cur.OwnerQQ
+                $oldBot = [string]$cur.BotQQ
+                $oldKeyEnc = [string]$cur.ApiKeyEnc
+                $oldPwEnc = [string]$cur.QqPasswordEnc
+            } catch { }
+        }
+        if ($OwnerQQ) { $oldOwner = $OwnerQQ }
+        if ($BotQQ) { $oldBot = $BotQQ }
+        if ($ApiKey) { $oldKeyEnc = (Protect-Text $ApiKey) }
+        if ($QqPassword) { $oldPwEnc = (Protect-Text $QqPassword) }
+
+        $o = [ordered]@{
+            OwnerQQ      = $oldOwner
+            BotQQ        = $oldBot
+            ApiKeyEnc    = $oldKeyEnc
+            QqPasswordEnc = $oldPwEnc
+            SavedAt      = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+        }
+        [IO.File]::WriteAllText($p, ($o | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false)))
+        return $true
+    } catch { return $false }
+}
 function Save-NapCatCred([string]$QQ, [string]$Password) {
     if (-not $QQ -or -not $Password) { return $false }
     try {
@@ -3340,6 +3413,31 @@ try {
     if ($QQ -and $QQ -notmatch '^\d{5,12}$') { Fail ('-QQ 格式不对：' + $QQ) '只填数字，5~12 位；不填也行，扫码后自动识别。' }
     $hasQqHint = [bool]$QQ
 
+    # 上次填过的信息，能复用就复用——客户每次重装都要重敲一遍，谁都会烦
+    if (-not $Quiet) {
+        $savedCfg = Get-DeployConfig
+        if ($savedCfg -and ($savedCfg.OwnerQQ -or $savedCfg.ApiKey)) {
+            Say ''
+            Say '  ┌─ 这台机器上存过上次填的信息 ──────────────────' 'Cyan'
+            if ($savedCfg.OwnerQQ) { Say ('  │  你的 QQ 号：' + $savedCfg.OwnerQQ) 'White' }
+            if ($savedCfg.BotQQ) { Say ('  │  机器人号：  ' + $savedCfg.BotQQ) 'DarkGray' }
+            if ($savedCfg.ApiKey) {
+                $head = $savedCfg.ApiKey.Substring(0, [Math]::Min(7, $savedCfg.ApiKey.Length))
+                Say ('  │  API Key：   ' + $head + '...（已加密）') 'DarkGray'
+            }
+            if ($savedCfg.QqPassword) { Say '  │  QQ 密码：   已记住（用于免扫码）' 'DarkGray' }
+            Say ('  │  存于 ' + $savedCfg.SavedAt) 'DarkGray'
+            Say '  └───────────────────────────────────────────────' 'Cyan'
+            $useSaved = Read-Host '  直接复用吗？（1 = 用这些，0 = 重新填）'
+            if ($useSaved -eq '1') {
+                if (-not $OwnerQQ) { $OwnerQQ = $savedCfg.OwnerQQ }
+                if (-not $QQ) { $QQ = $savedCfg.BotQQ }
+                if (-not $ApiKey) { $ApiKey = $savedCfg.ApiKey }
+                Ok '已填入，不用再敲了'
+            }
+        }
+    }
+
     # 该问的是"主人号"：当管理员、收测试消息都要它
     if (-not $OwnerQQ -and -not $Quiet) {
         Say ''
@@ -3351,6 +3449,7 @@ try {
         $OwnerQQ = Read-Host '  你的 QQ 号（纯数字，直接回车 = 先跳过）'
     }
     if ($OwnerQQ -and $OwnerQQ -notmatch '^\d{5,12}$') { Warn ('主人号格式看着不对：' + $OwnerQQ + '，先不管了') ; $OwnerQQ = '' }
+    if ($OwnerQQ) { Save-DeployConfig -OwnerQQ $OwnerQQ | Out-Null }
 
     if (-not $ApiKey -and -not $Quiet) {
         Say ''
@@ -3386,6 +3485,7 @@ try {
         if ($ApiKey) {
             $head = $ApiKey.Substring(0, [Math]::Min(7, $ApiKey.Length))
             Ok ('API Key 收到（' + $head + '...）')
+            Save-DeployConfig -ApiKey $ApiKey | Out-Null
         } else {
             Warn '没填 API Key：装完机器人不会回话，记得去 6185 面板补上'
         }
@@ -3442,6 +3542,7 @@ try {
             $QQ = $actualQQ
             Say ''
             Ok ('扫码成功，机器人号是 ' + $QQ)
+            Save-DeployConfig -BotQQ $QQ | Out-Null
             Set-NapCatConfig $napRoot $QQ $ob.Port $ob.Token
             if (Set-NapCatAutoLogin $napRoot $QQ) {
                 Info '已记下这个号，重启后试着自动登录（不灵会让你再扫一次）'
@@ -3515,6 +3616,7 @@ try {
             try { $plain = [Runtime.InteropServices.Marshal]::PtrToStringAuto($ptr) }
             finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
             if ($plain -and (Save-NapCatCred $QQ $plain)) {
+                Save-DeployConfig -QqPassword $plain | Out-Null
                 Ok '记住了，下次重启不用扫码'
             } else {
                 Warn '没存成功，下次还是扫码登录'
