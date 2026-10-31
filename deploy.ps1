@@ -1478,7 +1478,17 @@ function Set-AstrBotConfig($Target, [string]$QQNumber, [string]$Key, [switch]$Gr
     Step 4 '对齐 AstrBot 的 OneBot 服务端信息'
 
     if (-not (Test-Path $Target.Config)) {
-        Fail ('找不到 AstrBot 配置：' + $Target.Config) '先把 AstrBot 启动一次，让它生成 data\cmd_config.json，再重跑本脚本。'
+        # 没有配置时，先用内置模板初始化：模板里是作者调好的模型/人格/平台结构，
+        # 装完直接就是"能聊"的状态，不用客户自己从头配。
+        $tpl = Join-Path $PSScriptRoot 'templates\cmd_config.template.json'
+        if (Test-Path $tpl) {
+            $dstDir = Split-Path $Target.Config -Parent
+            if (-not (Test-Path $dstDir)) { New-Item -ItemType Directory -Path $dstDir -Force | Out-Null }
+            Copy-Item $tpl $Target.Config -Force
+            Info '用内置模板初始化配置（模型、人格都按调好的来）'
+        } else {
+            Fail ('找不到 AstrBot 配置：' + $Target.Config) '先把 AstrBot 启动一次，让它生成 data\cmd_config.json，再重跑本脚本。'
+        }
     }
     Backup-File $Target.Config
     $cfg = Read-Json $Target.Config
