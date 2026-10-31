@@ -192,7 +192,7 @@
                                                       "request_max_retries":  5
                                                   },
                                         "persona":  {
-                                                        "persona_id":  "1",
+                                                        "persona_id":  "default",
                                                         "safety_mode":  true,
                                                         "safety_mode_strategy":  "system_prompt"
                                                     },
