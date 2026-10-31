@@ -2142,9 +2142,9 @@ function Get-NapCatLoginUrl([string]$BaseUrl, [string]$Token) {
     return ($BaseUrl + '/webui?token=' + [Uri]::EscapeDataString($Token))
 }
 
-function Save-PanelCredentials([string]$Path, [string]$Password, [string]$NapCatUrl) {
+function Save-PanelCredentials([string]$Path, [string]$Password, [string]$NapCatUrl, [string]$NapCatToken) {
     try {
-        $napLogin = Get-NapCatLoginUrl $NapCatUrl $Password
+        $napLogin = Get-NapCatLoginUrl $NapCatUrl $NapCatToken
         $lines = @(
             'DSH-QQ 一键部署 —— 面板登录信息（照下面填就行）',
             ('生成时间：' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')),
@@ -2157,7 +2157,7 @@ function Save-PanelCredentials([string]$Path, [string]$Password, [string]$NapCat
             '=== NapCat 面板 ===',
             '打开这个链接会直接把令牌填好（不用手敲）：',
             ('  ' + $napLogin),
-            ('  令牌（token）：' + $Password),
+            ('  令牌（token）：' + $NapCatToken),
             '',
             '（两个都是本机服务；想换密码就重新跑一次部署脚本）'
         )
@@ -3576,7 +3576,7 @@ try {
     # 怎么输都是错的（这是实测踩到的坑）。
     if ($ob -and $ob.PanelPassword) {
         try {
-            Save-PanelCredentials (Join-Path $script:Root '面板密码.txt') $ob.PanelPassword ''
+            Save-PanelCredentials (Join-Path $script:Root '面板密码.txt') $ob.PanelPassword '' ''
         } catch { }
     }
 
@@ -3700,15 +3700,18 @@ try {
 
     # 配置完成 → 报密码 → 打开两个面板
     $webNap = Get-NapCatWebUi $napRoot
-    $panelPw = $script:PanelPassword
+    # AstrBot 密码和 NapCat 令牌是两个不同的东西，必须分开存
+    # （之前共用一个变量，被 NapCat 的 token 顶掉，客户拿 token 去登 AstrBot 当然错）
+    $astrBotPw = $script:PanelPassword
+    $napToken = ''
     $napUrl = 'http://127.0.0.1:6099'
     if ($webNap) {
         $napUrl = $webNap.Url
-        if ($webNap.Token) { $panelPw = $webNap.Token }
+        if ($webNap.Token) { $napToken = $webNap.Token }
     }
     $credFile = Join-Path $script:Root '面板密码.txt'
-    $napLoginUrl = Get-NapCatLoginUrl $napUrl $panelPw
-    if ($panelPw) { Save-PanelCredentials $credFile $panelPw $napUrl }
+    $napLoginUrl = Get-NapCatLoginUrl $napUrl $napToken
+    if ($astrBotPw -or $napToken) { Save-PanelCredentials $credFile $astrBotPw $napUrl $napToken }
 
     Say ''
     Say '  ============================================================' 'Green'
@@ -3720,27 +3723,27 @@ try {
     Say '   ┌─ 登录 AstrBot 面板（照这个填）──────────────' 'Cyan'
     Say '   │  地址：http://127.0.0.1:6185'
     Say '   │  用户名一栏填：astrbot' 'Yellow'
-    Say ('   │  密码一栏填：  ' + $panelPw) 'Yellow'
+    Say ('   │  密码一栏填：  ' + $astrBotPw) 'Yellow'
     Say '   └─────────────────────────────────────────────' 'Cyan'
     Say ''
     Say '   ┌─ 登录 NapCat 面板 ──────────────────────────' 'Cyan'
     Say ('   │  自动填好令牌的链接：' + $napLoginUrl) 'Yellow'
-    Say ('   │  （令牌本身：' + $panelPw + '）') 'DarkGray'
+    Say ('   │  令牌本身：' + $napToken) 'DarkGray'
     Say '   └─────────────────────────────────────────────' 'Cyan'
     Say ''
-    if ($panelPw) { Say ('   这些都存了一份：' + $credFile) 'DarkGray' }
+    if ($astrBotPw) { Say ('   这些都存了一份：' + $credFile) 'DarkGray' }
     Say ('   日志目录：' + $script:LogDir) 'DarkGray'
     Say ''
     Say '   正在帮你打开两个面板（没弹出就点上面的地址）……' 'DarkGray'
     if ($webNap) { Open-Panel $napLoginUrl 'NapCat 面板' }
     Open-Panel 'http://127.0.0.1:6185' 'AstrBot 面板'
     Say ''
-    Say ('   AstrBot 登录提醒：用户名填 astrbot，密码填 ' + $panelPw) 'Yellow'
+    Say ('   AstrBot 登录提醒：用户名填 astrbot，密码填 ' + $astrBotPw) 'Yellow'
     # 面板只认浏览器 localStorage 里的令牌，没法从网址带密码进去；
     # 能做到最省事的是把密码塞进剪贴板，用户按一次 Ctrl+V。
-    if ($panelPw) {
+    if ($astrBotPw) {
         try {
-            Set-Clipboard -Value $panelPw
+            Set-Clipboard -Value $astrBotPw
             Say '   密码已复制到剪贴板 —— 光标放进密码栏，按 Ctrl+V 就行。' 'Green'
         } catch {
             Say '   剪贴板不可用，照着上面手动输入。' 'DarkGray'
