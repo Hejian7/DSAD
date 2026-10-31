@@ -2912,6 +2912,15 @@ function Get-PathMb([string]$Path) {
 # 卸载：可选只删 AstrBot / 只删 NapCat / 只删插件 / 全删。
 # 能力就在 deploy.ps1 里；客户那边看到的是安装时顺带拉下来的 卸载.cmd。
 function Invoke-UninstallMenu {
+    # 卸载前先停服务。文件被进程占着的时候删不干净——.venv 里的 dll、
+    # napcat 的 node_modules、还有正在写的日志，都会留下半拉子残留，
+    # 客户下次重装就撞上"目录已存在但内容不对"。
+    Say ''
+    Say '   先停掉正在跑的服务……' 'DarkGray'
+    if (Stop-AstrBot) { Ok 'AstrBot 已停止' } else { Info 'AstrBot 本来没在跑' }
+    if (Stop-AllNapCat) { Ok 'NapCat 已停止' } else { Info 'NapCat 本来没在跑' }
+    Start-Sleep -Seconds 2
+
     $target = $UninstallTarget
     if ($target -eq 'ask') {
         Say ''
