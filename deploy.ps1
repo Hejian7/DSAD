@@ -3562,6 +3562,15 @@ try {
     if (-not $adminQQ) { $adminQQ = $QQ }
     $ob = Set-AstrBotConfig $ab $adminQQ $ApiKey -GroupMode:$Group -Wake $WakeWord -Gid $GroupId
 
+    # 立刻把密码落盘。配置里的哈希在这一刻已经换成新密码了，密码文件要是不跟着更新，
+    # 中途任何一步失败都会留下"配置是新密码、文件是旧密码"的局面——客户照着文件输，
+    # 怎么输都是错的（这是实测踩到的坑）。
+    if ($ob -and $ob.PanelPassword) {
+        try {
+            Save-PanelCredentials (Join-Path $script:Root '面板密码.txt') $ob.PanelPassword ''
+        } catch { }
+    }
+
     # 插件是选装：包里带 install-plugin.ps1 就装，没带就是基础版
     Invoke-OptionalPluginInstaller $ab $napRoot $ob.Port $OwnerQQ | Out-Null
 
