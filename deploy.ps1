@@ -2313,6 +2313,7 @@ function Wait-NapCatLogin([string]$NapCatPath, [string]$ExpectQQ, [int]$Port) {
     $lastReopen = 0
     $reopenCount = 0
     $adoptedOld = $false
+    $missCount = 0
 
     while ((Get-Date) -lt $deadline) {
         if ($script:InterruptRequested) { throw '用户已请求中断' }
@@ -2367,8 +2368,15 @@ function Wait-NapCatLogin([string]$NapCatPath, [string]$ExpectQQ, [int]$Port) {
         }
 
         if (-not (Get-NapCatRunning $NapCatPath)) {
-            Warn 'NapCat 进程已经不在了（登录窗口是不是被关掉了？）'
-            return $null
+            # 注入过程中 bootmain 会短暂消失再回来（它要重新拉起自己），
+            # 读一两次读不到是正常的。连着五六次都读不到，才认定真的没了。
+            $missCount++
+            if ($missCount -ge 6) {
+                Warn 'NapCat 进程已经不在了（登录窗口是不是被关掉了？）'
+                return $null
+            }
+        } else {
+            $missCount = 0
         }
 
         if (($elapsed - $lastBeat) -ge 30) {
