@@ -120,6 +120,11 @@ $script:LogDir = Join-Path $script:Root 'logs'
 $script:LogFile = Join-Path $script:LogDir ('deploy-{0}.log' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
 $script:InstallUrl = 'https://docs.astrbot.app/install.ps1'
 
+# 填过的信息（QQ 号 / API Key / QQ 密码）不放在安装目录里：
+# 卸载选"全删"会把 ds-as-nap\ 整个端掉，但这些东西是"你的数据"，
+# 不是"程序"，得留着——重装一次不用再敲一遍。
+$script:DataDir = Join-Path $env:LOCALAPPDATA 'DSH-QQ'
+
 # uv 默认把下载缓存放到 %LOCALAPPDATA%\uv\cache；钉到这里，别散出去
 $env:UV_CACHE_DIR = Join-Path $script:AsRoot 'uv-cache'
 if (-not $Uninstall -and -not (Test-Path $env:UV_CACHE_DIR)) { New-Item -ItemType Directory -Path $env:UV_CACHE_DIR -Force -ErrorAction SilentlyContinue | Out-Null }
@@ -2422,7 +2427,7 @@ function Wait-NapCatConnected([int]$Port, [int]$TimeoutSec = 120) {
 #     这个窗口期很短，但确实存在。交互里会跟客户讲明白。
 # ── 部署填过的信息，攒着下次用 ─────────────────────────────────────────────
 # 客户重装一次就要重新敲一遍 QQ 号、API Key，谁都会烦。
-# 这里把填过的存到 ds-as-nap\deploy-config.json，下次部署开场先问要不要复用。
+# 这里把填过的存到 %LOCALAPPDATA%\DSH-QQ\deploy-config.json（不放在安装目录，卸载不会带走），下次部署开场先问要不要复用。
 # API Key 和 QQ 密码都是敏感东西，用 Windows DPAPI 加密（绑定当前用户，
 # 拷到别的机器上就是乱码）。主人号、机器人号不加密——它们本来就是公开信息。
 function Protect-Text([string]$Text) {
@@ -2443,7 +2448,7 @@ function Unprotect-Text([string]$Cipher) {
 }
 
 function Get-DeployConfig {
-    $p = Join-Path $script:Root 'deploy-config.json'
+    $p = Join-Path $script:DataDir 'deploy-config.json'
     if (-not (Test-Path $p)) { return $null }
     try {
         $o = Get-Content $p -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -2466,7 +2471,8 @@ function Save-DeployConfig {
         [string]$QqPassword = ''
     )
     try {
-        $p = Join-Path $script:Root 'deploy-config.json'
+        $p = Join-Path $script:DataDir 'deploy-config.json'
+        if (-not (Test-Path $script:DataDir)) { New-Item -ItemType Directory -Path $script:DataDir -Force | Out-Null }
         $oldOwner = ''; $oldBot = ''; $oldKeyEnc = ''; $oldPwEnc = ''
         if (Test-Path $p) {
             try {
@@ -2489,6 +2495,7 @@ function Save-DeployConfig {
             QqPasswordEnc = $oldPwEnc
             SavedAt      = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
         }
+        if (-not (Test-Path $script:DataDir)) { New-Item -ItemType Directory -Path $script:DataDir -Force | Out-Null }
         [IO.File]::WriteAllText($p, ($o | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false)))
         return $true
     } catch { return $false }
@@ -2498,14 +2505,15 @@ function Save-NapCatCred([string]$QQ, [string]$Password) {
     try {
         $sec = ConvertTo-SecureString $Password -AsPlainText -Force
         $enc = ConvertFrom-SecureString $sec
-        $p = Join-Path $script:Root 'napcat-cred.txt'
+        $p = Join-Path $script:DataDir 'napcat-cred.txt'
+        if (-not (Test-Path $script:DataDir)) { New-Item -ItemType Directory -Path $script:DataDir -Force | Out-Null }
         [IO.File]::WriteAllText($p, ($QQ + "`r`n" + $enc), (New-Object System.Text.UTF8Encoding($false)))
         return $true
     } catch { return $false }
 }
 
 function Get-NapCatCred {
-    $p = Join-Path $script:Root 'napcat-cred.txt'
+    $p = Join-Path $script:DataDir 'napcat-cred.txt'
     if (-not (Test-Path $p)) { return $null }
     try {
         $lines = [IO.File]::ReadAllLines($p, [Text.Encoding]::UTF8)
@@ -2519,7 +2527,7 @@ function Get-NapCatCred {
 }
 
 function Remove-NapCatCred {
-    $p = Join-Path $script:Root 'napcat-cred.txt'
+    $p = Join-Path $script:DataDir 'napcat-cred.txt'
     Remove-Item $p -Force -ErrorAction SilentlyContinue
 }
 
@@ -2997,6 +3005,7 @@ function Invoke-UninstallMenu {
     }
 
     Say ''
+    if (Test-Path $script:DataDir) { Say ('   填过的 QQ 号 / API Key / 密码还在：' + $script:DataDir) 'DarkGray'; Say '   （下次重装会自动问你用不用；想清掉就直接删这个目录）' 'DarkGray' }
     if ($failed -eq 0) { Say '   卸载完成。' 'Green'; return 0 }
     Say ('  有 ' + $failed + ' 项没删掉，通常是进程还占着文件。关掉相关窗口再试。') 'Yellow'
     return 1
@@ -3602,7 +3611,7 @@ try {
     Invoke-TestMessage $ob.Token $QQ
 
     # 收尾一问：要不要记住密码，以后重启免扫码。
-    # 只问一次——已经存过就不再啰嗦（想改密码就删 ds-as-nap\napcat-cred.txt 重跑）。
+    # 只问一次——已经存过就不再啰嗦（想改密码就用「记住密码.cmd」关掉再开）。
     if (-not $Quiet -and $QQ -and -not (Get-NapCatCred)) {
         Say ''
         Say '   每次重启都要拿手机扫码，挺烦的。可以把这个号的密码记住，让 NapCat 直接登录。' 'White'
